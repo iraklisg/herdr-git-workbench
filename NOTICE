@@ -1,0 +1,10 @@
+Git Workbench for Herdr
+
+This product includes code derived from the "changes" mod shipped with
+Herdr (herdr-app 0.1.16), licensed under the Apache License, Version 2.0.
+https://herdr.dev
+
+The icons in mods/git-workbench/icons/ are from Lucide
+(https://lucide.dev), licensed under the ISC License; some of them come from
+Feather and are licensed under the MIT License. See
+mods/git-workbench/icons/LICENSE-Lucide.txt.

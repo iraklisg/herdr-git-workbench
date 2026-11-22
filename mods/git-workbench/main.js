@@ -1,0 +1,557 @@
+// Changes for several git repos at once, as a tree per repo, with staging.
+// Derived from the "changes" mod shipped with Herdr (Apache-2.0); modified.
+// The repo list for a project is kept in Herdr's shared state ("git-workbench.projects"), keyed by the project root.
+import { View, div, svg } from "gpui-kit";
+import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, pickFolder, checking, shared, setShared } from "herdr";
+
+const ICON = (name) => "mods/git-workbench/icons/" + name + ".svg";
+const ROW = 26, REPO_ROW = 30, LIMIT = 1000, DIFF_MIN = 160, DIFF_HEADER = 42, GROUP_INDENT = 8, CARD_GAP = 8, LIST_MIN = 100;
+const SPLIT = "git-workbench.split";
+// The last terminal folder seen in each space. When a mod pane (this one, or any other)
+// has the focus, it has no folder, so the panel keeps showing the project of that terminal.
+// Kept at module level on purpose: every copy of the mod shares it.
+const lastFolder = new Map();
+function location() {
+  const space = spaces().find((s) => s.active), f = focused();
+  const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
+  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  if (pane && pane.terminal === null) {
+    // Nothing seen yet in this space: its folder.
+    return (space && lastFolder.get(space.id)) || { cwd: space?.folder, on };
+  }
+  const here = { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+  if (space && (pane?.cwd || f?.cwd)) lastFolder.set(space.id, here);
+  return here;
+}
+const locationKey = () => JSON.stringify(location());
+
+// Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
+// the folder watch would see it, and every refresh would start the next one.
+const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
+const untab = (text) => text.replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
+
+// Rows of a unified diff, and of git's combined diff for a conflicted file: "@@@" hunks with
+// one marker column per parent. Lines without "-" in their markers get the new line number.
+function diffRows(lines) {
+  let old = 0, next = 0, width = 1;
+  return lines.map((line) => {
+    const hunk = /^(@{2,}) (?:-\d+(?:,\d+)? )+\+(\d+)/.exec(line);
+    if (hunk) {
+      width = hunk[1].length - 1; next = +hunk[2];
+      old = width === 1 ? +/^@@ -(\d+)/.exec(line)[1] : 0;
+      return { kind: "@", text: line };
+    }
+    const marks = line.slice(0, width);
+    if (marks.length < width || !/^[ +-]+$/.test(marks)) return { kind: "", text: line };
+    const text = untab(line.slice(width)) || " ";
+    if (marks.includes("-")) return { kind: "-", number: width === 1 ? old++ : undefined, text };
+    if (width === 1) old++;
+    return { kind: marks.includes("+") ? "+" : " ", number: next++, text };
+  });
+}
+
+// Paths
+function normalize(path) {
+  const out = [];
+  for (const part of path.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") out.pop(); else out.push(part);
+  }
+  return "/" + out.join("/");
+}
+function relative(from, to) {
+  const a = from.split("/").filter(Boolean), b = to.split("/").filter(Boolean);
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return [...a.slice(i).map(() => ".."), ...b.slice(i)].join("/");
+}
+const inside = (path, root) => path === root || path.startsWith(root.endsWith("/") ? root : root + "/");
+const basename = (path) => path.split("/").filter(Boolean).pop() ?? path;
+
+// Storage: { "<machine:>/abs/root": ["relative/repo", "../other"] }.
+// Herdr's shared state, not localStorage: localStorage is per mod copy, and Herdr runs several copies.
+const STORE = "git-workbench.projects";
+function loadProjects() {
+  const value = shared(STORE);
+  return value && typeof value === "object" ? value : {};
+}
+function saveProjects(projects) { setShared(STORE, { ...projects }); }
+const projectKey = (root, on) => (on ? on + ":" : "") + root;
+
+function parseNumstat(text, into) {
+  for (const entry of text.split("\0")) {
+    const [a, d, ...parts] = entry.split("\t");
+    if (!parts.length) continue;
+    into[parts.join("\t")] = { add: Number(a) || 0, del: Number(d) || 0, binary: a === "-" };
+  }
+}
+
+function buildTree(files) {
+  const root = { dirs: new Map(), files: [] };
+  for (const f of files) {
+    const parts = f.path.split("/");
+    let node = root;
+    for (const part of parts.slice(0, -1)) {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    }
+    node.files.push(f);
+  }
+  return root;
+}
+// The top file row of a tree: folders come first, each level sorted by name.
+function firstFile(node) {
+  const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  if (dirs.length) return firstFile(dirs[0][1]);
+  return [...node.files].sort((a, b) => a.path.localeCompare(b.path))[0];
+}
+function filesUnder(node, out = []) {
+  out.push(...node.files);
+  for (const child of node.dirs.values()) filesUnder(child, out);
+  return out;
+}
+
+export default class GitWorkbench extends View {
+  init(_props, cx) {
+    this.repos = []; this.rows = []; this.diffWidth = 0;
+    this.collapsed = new Set();
+    this.open = null; this.closed = false; this.editing = false;
+    if (checking()) return;
+    this.refresh(cx);
+    cx.timer.every(10000, (cx) => this.refresh(cx));
+  }
+
+  // Which project the focused folder belongs to: the longest saved root that contains it, else its own repo.
+  async resolve(cwd, on) {
+    const projects = loadProjects();
+    let best = null;
+    for (const key of Object.keys(projects)) {
+      const prefix = on ? on + ":" : "";
+      if (on ? !key.startsWith(prefix) : !key.startsWith("/")) continue;
+      const root = key.slice(prefix.length);
+      if (inside(cwd, root) && (!best || root.length > best.length)) best = root;
+    }
+    if (best) return { root: best, extra: projects[projectKey(best, on)] ?? [] };
+    const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
+    if (top.code !== 0) return null;
+    return { root: top.stdout.trim(), extra: [] };
+  }
+
+  // Folder watches work on this computer only; remote projects rely on the 10-second timer.
+  // After a failed watch (Herdr allows 64), the set is tried again a minute later.
+  watch(paths, cx) {
+    const signature = (this.on ?? "") + "\n" + paths.join("\n"), current = this.watching;
+    if (!this.on && current?.signature === signature && (!current.failedAt || Date.now() - current.failedAt < 60000)) return;
+    this.stopWatching();
+    if (this.on) return;
+    const token = { signature, handles: [], failedAt: 0 };
+    this.watching = token;
+    for (const path of paths) cx.spawn(async (cx) => {
+      try {
+        while (this.watching === token) {
+          const w = watchFolder(path); token.handles.push(w);
+          await w;
+          token.handles = token.handles.filter(h => h !== w);
+          if (this.watching === token) this.refresh(cx);
+        }
+      } catch { token.failedAt = Date.now(); /* the 10-second timer still refreshes */ }
+    });
+  }
+
+  stopWatching() {
+    for (const w of this.watching?.handles ?? []) w.cancel?.();
+    this.watching = null;
+  }
+
+  refresh(cx) {
+    if (this.busy) return;
+    if (this.loading) { this.again = true; return; }
+    const { cwd, on } = location();
+    this.locKey = locationKey();
+    if (!cwd) { this.stopWatching(); this.repos = []; this.root = null; this.error = null; cx.notify(); return; }
+    this.loading = true; this.again = false;
+    cx.spawn(async (cx) => {
+      const asked = this.locKey;
+      try {
+        const project = await this.resolve(cwd, on);
+        if (asked !== locationKey()) return;
+        if (!project) { this.stopWatching(); this.root = null; this.repos = []; this.error = "Not a git repository: " + (cwd || "no folder"); this.setOpen(null); return; }
+        if (project.root !== this.root || on !== this.on) {
+          this.collapsed = new Set(); this.setOpen(null); this.closed = false; this.editing = false; this.note = null;
+        }
+        this.root = project.root; this.on = on;
+        const rels = ["", ...project.extra.filter(r => r !== "")];
+        const paths = rels.map(rel => rel ? normalize(this.root + "/" + rel) : this.root);
+        const repos = await Promise.all(paths.map((path, i) => this.readRepo(path, rels[i], paths)));
+        if (asked !== locationKey()) return;
+        this.repos = repos; this.error = null;
+        this.watch(paths.filter(p => !paths.some(o => o !== p && inside(p, o))), cx);
+        const exists = (sel) => this.repos.find(r => r.path === sel.repo)?.[sel.group].some(f => f.path === sel.path);
+        if (this.open && !exists(this.open)) this.setOpen(null);
+        if (!this.open && !this.closed) {
+          const repo = this.repos.find(r => r.staged.length || r.changes.length);
+          if (repo) { const group = repo.staged.length ? "staged" : "changes"; this.open = { repo: repo.path, group, path: firstFile(buildTree(repo[group])).path }; }
+        }
+        if (this.open) {
+          try { await this.load(this.open, asked); }
+          catch { if (asked === locationKey()) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+        }
+      } catch (e) { if (asked === locationKey()) this.error = String(e?.message ?? e); }
+      finally {
+        this.loading = false; cx.notify();
+        if (this.again || asked !== locationKey()) this.refresh(cx);
+      }
+    });
+  }
+
+  async readRepo(path, rel, all) {
+    const on = this.on;
+    // The name is the repo's folder; the hint is where it is, each parent folder by its first letter
+    // (p/w for packages/web), ".." kept. The project root has no hint.
+    const name = basename(path), hint = rel.split("/").slice(0, -1).map(p => p === ".." ? p : [...p][0]).join("/");
+    const repo = { path, rel, name, hint, branch: "", staged: [], changes: [], error: null, hasHead: true, limited: false, ahead: null, behind: null };
+    try {
+      const git = (args) => exec("git", [...READ, ...args], { cwd: path, on });
+      const [status, head, branch, cached, worktree, sync] = await Promise.all([
+        git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]),
+        git(["rev-parse", "--verify", "-q", "HEAD"]),
+        git(["branch", "--show-current"]),
+        git(["diff", "--cached", "--numstat", "-z", "--no-renames"]),
+        git(["diff", "--numstat", "-z", "--no-renames"]),
+        // Commits behind and ahead of the upstream branch, as of the last fetch. Fails without an upstream.
+        git(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]),
+      ]);
+      if (status.code !== 0) throw new Error(status.stderr.trim() || "git status failed");
+      repo.hasHead = head.code === 0;
+      repo.branch = branch.stdout.trim() || "detached";
+      if (sync.code === 0) { const [behind, ahead] = sync.stdout.trim().split(/\s+/).map(Number); repo.behind = behind; repo.ahead = ahead; }
+      const stagedStats = {}, worktreeStats = {};
+      if (cached.code === 0) parseNumstat(cached.stdout, stagedStats);
+      if (worktree.code === 0) parseNumstat(worktree.stdout, worktreeStats);
+      // Other selected repos inside this one show as untracked folders here: they have their own section.
+      const nested = all.filter(p => p !== path && inside(p, path)).map(p => relative(path, p));
+      const entries = status.stdout.split("\0").filter(Boolean);
+      repo.limited = entries.length > LIMIT;
+      for (const entry of entries.slice(0, LIMIT)) {
+        const xy = entry.slice(0, 2), file = entry.slice(3), clean = file.replace(/\/$/, "");
+        if (nested.some(n => clean === n || clean.startsWith(n + "/"))) continue;
+        // An untracked folder here is a nested repo that is not in the list (git does not look inside it).
+        if (xy === "??") { repo.changes.push({ path: clean, mark: "U", untracked: true, nestedRepo: file.endsWith("/"), add: 0, del: 0 }); continue; }
+        if (xy === "!!") continue;
+        if (xy.includes("U") || xy === "AA" || xy === "DD") { repo.changes.push({ path: file, mark: "!", conflict: true, add: 0, del: 0 }); continue; }
+        const [x, y] = xy;
+        if (x !== " ") repo.staged.push({ path: file, mark: x === "A" ? "A" : x === "D" ? "D" : "M", ...(stagedStats[file] ?? { add: 0, del: 0 }) });
+        if (y !== " ") repo.changes.push({ path: file, mark: y === "D" ? "D" : "M", ...(worktreeStats[file] ?? { add: 0, del: 0 }) });
+      }
+    } catch (e) { repo.error = String(e?.message ?? e); }
+    return repo;
+  }
+
+  async load(sel, context) {
+    const repo = this.repos.find(r => r.path === sel.repo), file = repo?.[sel.group].find(f => f.path === sel.path);
+    if (!file) return;
+    let lines;
+    if (file.nestedRepo) lines = ["Nested git repository · add it with the repositories button to see its changes"];
+    else if (file.untracked) {
+      const text = await readTextFile(repo.path + "/" + file.path, { on: this.on }).catch(() => null);
+      if (text === null) lines = ["Cannot preview this file (binary, too large, or unreadable)"];
+      else if (text.includes("\0")) lines = ["Binary file · no text diff"];
+      else {
+        const count = countLines(text);
+        lines = ["@@ -0,0 +1," + count + " @@", ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => "+" + l)];
+      }
+    } else {
+      const args = ["--literal-pathspecs", ...READ, "diff", ...(sel.group === "staged" ? ["--cached"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", file.path];
+      const r = await exec("git", args, { cwd: repo.path, on: this.on });
+      if (r.code !== 0) throw new Error(r.stderr);
+      const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
+      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+    }
+    if (context === locationKey() && this.isOpen(sel)) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
+  }
+
+  isOpen(sel) { return Boolean(this.open && sel && this.open.repo === sel.repo && this.open.group === sel.group && this.open.path === sel.path); }
+
+  setOpen(sel) { this.open = sel; this.setLines([]); }
+
+  setLines(lines) {
+    this.rows = diffRows(lines);
+    this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7 + 50));
+  }
+
+  pick(sel, cx) {
+    const same = this.isOpen(sel);
+    this.setOpen(same ? null : sel); this.note = null; this.closed = same;
+    const context = this.locKey;
+    if (!same) cx.spawn(async (cx) => {
+      try { await this.load(sel, context); }
+      catch (e) { if (context === locationKey() && this.isOpen(sel)) this.note = "Cannot preview this diff (too large or unreadable): " + e; }
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  toggle(key, cx) { if (this.collapsed.has(key)) this.collapsed.delete(key); else this.collapsed.add(key); cx.notify(); }
+
+  // Runs git commands that change a repo, one action at a time.
+  act(repo, steps, cx) {
+    if (this.busy) return;
+    this.busy = true; this.note = null;
+    cx.spawn(async (cx) => {
+      try {
+        for (const args of steps) {
+          if (!args) continue;
+          const r = await exec("git", ["--literal-pathspecs", ...args], { cwd: repo.path, on: this.on });
+          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        }
+      } catch (e) { this.note = repo.name + ": " + String(e?.message ?? e); }
+      finally { this.busy = false; this.refresh(cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  stage(repo, files, cx) {
+    if (files.length) this.act(repo, [["add", "-A", "--", ...files.map(f => f.path)]], cx);
+  }
+
+  unstage(repo, files, cx) {
+    if (!files.length) return;
+    const paths = files.map(f => f.path);
+    this.act(repo, [repo.hasHead ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "-f", "-q", "-r", "--", ...paths]], cx);
+  }
+
+  // Repo list editing
+  editRepos(cx) {
+    this.editing = !this.editing;
+    cx.notify();
+  }
+
+  async toplevel(path) {
+    const r = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: path, on: this.on }).catch(() => null);
+    return r?.code === 0 ? r.stdout.trim() : null;
+  }
+
+  addRepos(paths) {
+    const projects = loadProjects(), key = projectKey(this.root, this.on);
+    const list = new Set(projects[key] ?? []);
+    let added = 0;
+    for (const p of paths) {
+      if (!p || p === this.root) continue;
+      const rel = relative(this.root, p);
+      if (!list.has(rel)) { list.add(rel); added++; }
+    }
+    projects[key] = [...list].sort();
+    saveProjects(projects);
+    return added;
+  }
+
+  removeRepo(rel, cx) {
+    const projects = loadProjects(), key = projectKey(this.root, this.on);
+    const list = (projects[key] ?? []).filter(r => r !== rel);
+    if (list.length) projects[key] = list; else delete projects[key];
+    saveProjects(projects);
+    this.refresh(cx); cx.notify();
+  }
+
+  addFolder(cx) {
+    cx.spawn(async (cx) => {
+      const folder = await pickFolder({ prompt: "Choose a git repository" });
+      if (!folder) return;
+      const top = await this.toplevel(folder);
+      if (!top) this.note = folder + " is not in a git repository";
+      else { const added = this.addRepos([top]); this.note = added ? null : basename(top) + " is already in the list"; }
+      this.refresh(cx); cx.notify();
+    });
+  }
+
+  // Rendering
+  iconButton(id, icon, t, onClick) {
+    return div().id(id).size(20).flex_none().flex().items_center().justify_center().rounded(4).cursor_pointer()
+      .hover((s) => s.bg(t.raised))
+      .on_click((_e, cx) => { cx.stop_propagation(); onClick(cx); })
+      .child(svg(ICON(icon)).size(14).text_color(t.muted));
+  }
+
+  hoverable(el, id) {
+    return el.on_hover((hovered, cx) => {
+      if (hovered) this.hovered = id; else if (this.hovered === id) this.hovered = null;
+      cx.notify();
+    });
+  }
+
+  actions(repo, group, files, id, t) {
+    if (this.hovered !== id || this.busy) return [];
+    if (group === "staged") return [this.iconButton(id + "-unstage", "minus", t, (cx) => this.unstage(repo, files, cx))];
+    return [this.iconButton(id + "-stage", "plus", t, (cx) => this.stage(repo, files.filter(f => !f.conflict), cx))];
+  }
+
+  markColor(mark, t) {
+    return mark === "A" || mark === "U" ? t.ansi2 : mark === "D" || mark === "!" ? t.ansi1 : t.blocked;
+  }
+
+  // A row inside a group, indented under its repo.
+  groupLine(id, depth, t) {
+    return h_flex().id(id).h(ROW).flex_none().pr(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+      .child(div().w(GROUP_INDENT + depth * 14).flex_none());
+  }
+
+  treeRows(repo, group, node, prefix, depth, out, t) {
+    const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    for (let [name, child] of dirs) {
+      // Compact folders: a folder holding only one folder shows as a/b/c.
+      while (child.files.length === 0 && child.dirs.size === 1) {
+        const [nextName, next] = [...child.dirs.entries()][0];
+        name += "/" + nextName; child = next;
+      }
+      const path = prefix ? prefix + "/" + name : name, key = "d:" + repo.path + ":" + group + ":" + path, open = !this.collapsed.has(key);
+      const id = "row-" + key, files = filesUnder(child);
+      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).on_click((_e, cx) => this.toggle(key, cx))
+        .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
+        .child(svg(ICON("folder")).size(13).flex_none().text_color(t.muted))
+        .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(name))
+        .children(this.actions(repo, group, files, id, t)), id) });
+      if (open) this.treeRows(repo, group, child, path, depth + 1, out, t);
+    }
+    for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
+      const sel = { repo: repo.path, group, path: f.path }, id = "row-f:" + repo.path + ":" + group + ":" + f.path;
+      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isOpen(sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
+        .child(div().w(12).flex_none())
+        .child(div().flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : "")))
+        .children(this.actions(repo, group, [f], id, t))
+        .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + f.add)))
+        .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("−" + f.del)))
+        .child(div().w(12).flex_none().text_size(11).text_color(this.markColor(f.mark, t)).child(f.mark)), id) });
+    }
+  }
+
+  groupRows(repo, group, title, files, out, t) {
+    if (!files.length) return;
+    const key = "g:" + repo.path + ":" + group, open = !this.collapsed.has(key), id = "row-" + key;
+    out.push({ h: ROW, el: this.hoverable(this.groupLine(id, 0, t).gap(6).on_click((_e, cx) => this.toggle(key, cx))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(title))
+      .children(this.actions(repo, group, files, id, t))
+      .child(div().px(5).rounded(8).bg(t.raised).text_size(10).text_color(t.muted).child(String(files.length))), id) });
+    if (open) this.treeRows(repo, group, buildTree(files), "", 1, out, t);
+  }
+
+  repoRows(repo, out, t) {
+    const key = "r:" + repo.path, open = !this.collapsed.has(key), count = repo.staged.length + repo.changes.length;
+    // A gap, then the repo as a band, so each repo reads as its own section.
+    if (out.length) out.push({ h: 6, el: div().h(6).flex_none() });
+    out.push({ h: REPO_ROW, el: h_flex().id("row-" + key).h(REPO_ROW).flex_none().px(6).gap(6).items_center().rounded(6).bg(t.raised).cursor_pointer()
+      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.toggle(key, cx))
+      .child(svg(ICON("book-marked")).size(14).flex_none().text_color(t.muted))
+      // When space is short, the hint gives way first, then the name; the branch keeps up to 140px.
+      .child(div().min_w(0).truncate().font_semibold().child(repo.name))
+      .child(div().id("hint-" + key).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(repo.hint)
+        .when(Boolean(repo.hint), (e) => e.tooltip(repo.rel)))
+      .child(svg(ICON("git-branch")).size(12).flex_none().text_color(t.dim))
+      .child(div().flex_none().max_w(140).truncate().text_size(11).text_color(t.dim).child(repo.branch))
+      // The same style as the Spaces sidebar: only counts above zero, outgoing first.
+      .when(repo.ahead > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child("↑" + repo.ahead)))
+      .when(repo.behind > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child("↓" + repo.behind)))
+      .child(div().px(5).rounded(8).bg(t.background).text_size(10).text_color(t.muted).child(String(count))) });
+    if (!open) return;
+    if (repo.error) { out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().truncate().text_size(11).text_color(t.ansi1).child(repo.error) }); return; }
+    if (!count) out.push({ h: ROW, el: div().pl(GROUP_INDENT).h(ROW).flex_none().flex().items_center().text_size(12).text_color(t.dim).child("No changes") });
+    this.groupRows(repo, "staged", "Staged", repo.staged, out, t);
+    this.groupRows(repo, "changes", "Unstaged", repo.changes, out, t);
+    if (repo.limited) out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files") });
+  }
+
+  editorRows(out, t) {
+    const projects = loadProjects(), extra = projects[projectKey(this.root, this.on)] ?? [];
+    const button = (id, label, onClick) => div().id(id).h(26).px(10).flex().flex_none().items_center().rounded(6).border_1().border_color(t.border).cursor_pointer().text_size(12)
+      .hover((s) => s.bg(t.hover)).on_click((_e, cx) => onClick(cx)).child(label);
+    out.push({ h: ROW, el: div().px(8).h(ROW).flex_none().flex().items_center().text_size(12).text_color(t.muted).child("Repositories in " + basename(this.root)) });
+    out.push({ h: ROW, el: h_flex().h(ROW).flex_none().px(8).gap(6).items_center()
+      .child(div().flex_1().min_w(0).truncate().child(basename(this.root))).child(div().text_size(11).text_color(t.dim).child("project root")) });
+    for (const rel of extra) out.push({ h: ROW, el: h_flex().id("repo-" + rel).h(ROW).flex_none().px(8).gap(6).items_center().rounded(6).hover((s) => s.bg(t.hover))
+      .child(div().flex_1().min_w(0).truncate().child(rel))
+      .child(this.iconButton("remove-" + rel, "x", t, (cx) => this.removeRepo(rel, cx))) });
+    out.push({ h: 38, el: h_flex().h(38).flex_none().px(8).gap(6).items_center()
+      .when(!this.on, (e) => e.child(button("add-folder", "Add folder…", (cx) => this.addFolder(cx))))
+      .child(button("done", "Done", (cx) => this.editRepos(cx))) });
+  }
+
+  // A bar over the diff: which file, which part (staged or not), and a button to close it.
+  diffHeader(t) {
+    const repo = this.repos.find(r => r.path === this.open.repo), file = repo?.[this.open.group].find(f => f.path === this.open.path);
+    const parts = this.open.path.split("/"), name = parts.pop();
+    // git reports no line counts for an untracked file: count the added lines of its preview.
+    const add = file?.untracked ? this.rows.filter(r => r.kind === "+").length : file?.add ?? 0;
+    return h_flex().h(DIFF_HEADER).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+      .child(div().flex_none().font_semibold().child(name))
+      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child([repo?.rel || repo?.name, ...parts].filter(Boolean).join("/")))
+      .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.open.group === "staged" ? "Staged" : "Unstaged"))
+      .when(add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + add)))
+      .when(file?.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("−" + file.del)))
+      .child(this.iconButton("diff-close", "x", t, (cx) => this.pick(this.open, cx)));
+  }
+
+  diffRow({ kind, number, text }, t) {
+    if (kind === "@") return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(text);
+    return h_flex().w_full().h(20).flex_none().gap(10).when(kind === "+", (e) => e.bg(t.ansi2 + "18")).when(kind === "-", (e) => e.bg(t.ansi1 + "18"))
+      .child(div().w(30).flex_none().text_right().text_color(t.dim).child(number === undefined ? "" : String(number)))
+      .child(div().flex_1().min_w(0).truncate().child(text));
+  }
+
+  render(cx) {
+    if (!checking() && locationKey() !== this.locKey) this.refresh(cx);
+    const t = theme();
+    const files = this.repos.flatMap(r => [...r.staged, ...r.changes]);
+    const add = files.reduce((n, f) => n + (f.add || 0), 0), del = files.reduce((n, f) => n + (f.del || 0), 0);
+    const out = [];
+    if (this.editing && this.root) this.editorRows(out, t);
+    else for (const repo of this.repos) this.repoRows(repo, out, t);
+    // Two cards: the list, and the diff of the open file below it. Without an open file the list card fills the panel.
+    // listHeight is the first height of the list: what it needs, with at least DIFF_MIN left for the diff.
+    const height = out.reduce((n, r) => n + r.h, 0) + 12;
+    // Measured sizes and mouse positions are screen pixels; h() and the others are zoomed pixels.
+    const zoom = Number(settings().zoom) || 1, panelHeight = (this.size?.height ?? 600) / zoom;
+    const available = panelHeight - 44 - (this.note ? 28 : 0) - (this.open ? CARD_GAP + 2 + DIFF_HEADER + DIFF_MIN : 0);
+    const listHeight = Math.max(56, Math.min(height, available));
+    const empty = this.error || (this.loading ? "Loading changes…" : this.root ? null : "No folder");
+    const card = () => v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border);
+    const list = v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).children(out.map(r => r.el))
+      .when(!out.length || (!this.editing && Boolean(empty)), (e) => e.child(div().p(8).text_color(t.dim).child(empty || "No repositories")));
+    const listCard = card()
+      .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+        .child(div().font_semibold().child("Changes"))
+        .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(files.length + " files · " + this.repos.length + (this.repos.length === 1 ? " repo" : " repos")))
+        .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child("+" + add)).child(div().text_size(11).text_color(t.ansi1).child("−" + del))
+        .when(Boolean(this.root), (e) => e.child(div().id("edit-repos").size(24).flex().items_center().justify_center().rounded(6).cursor_pointer()
+          .when(this.editing, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.editRepos(cx))
+          .child(svg(ICON("layers")).size(14).text_color(t.muted)))))
+      .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("changes-list").absolute().inset_0()))
+      .when(Boolean(this.note), (e) => e.child(div().px(10).py(6).border_t(1).border_color(t.border).text_size(11).text_color(t.ansi1).child(this.note)));
+    const root = v_flex().id("git-workbench").on_size_change((size, cx) => { this.size = size; cx.notify(); }).size_full().min_h(0).text_color(t.foreground).text_size(13);
+    if (!this.open || !this.size) return root.child(listCard);
+    const diffCard = card()
+      .child(this.diffHeader(t))
+      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
+        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
+          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 20, (i) => String(i),
+            (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
+        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0()));
+    // Drag the gap between the two cards to resize them. The first height is what the list needs;
+    // after a drag, the height is kept in shared state for all panels and restarts.
+    const total = panelHeight, most = Math.max(LIST_MIN, total - CARD_GAP - DIFF_HEADER - DIFF_MIN - 2);
+    const top = Math.min(most, Math.max(LIST_MIN, this.dragTop ?? (Number(shared(SPLIT)) || null) ?? 44 + (this.note ? 28 : 0) + listHeight));
+    const endDrag = () => {
+      if (!this.drag) return;
+      if (this.dragTop != null) setShared(SPLIT, Math.round(this.dragTop));
+      this.drag = null; this.dragTop = null;
+    };
+    return root
+      .on_mouse_move((e, cx) => { if (this.drag) { this.dragTop = Math.min(most, Math.max(LIST_MIN, this.drag.top + (e.position.y - this.drag.y) / zoom)); cx.notify(); } })
+      .on_mouse_up("left", (_e, cx) => { endDrag(); cx.notify(); })
+      .on_hover((hovered, cx) => { if (!hovered) { endDrag(); cx.notify(); } })
+      .child(div().flex_none().h(top).child(listCard))
+      .child(div().id("split-handle").flex_none().h(CARD_GAP).cursor_row_resize()
+        .on_mouse_down("left", (e, cx) => { this.drag = { y: e.position.y, top }; cx.stop_propagation(); }))
+      .child(div().flex_1().min_h(0).child(diffCard));
+  }
+}
