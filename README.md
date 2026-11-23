@@ -5,9 +5,9 @@ A Changes panel for the [Herdr](https://herdr.dev) desktop app that shows
 
 ![Git Workbench](preview.png)
 
-- Each repository is its own section with its branch and its ↑ outgoing / ↓ incoming commits.
+- Each repository is its own section with its branch and its ↑ outgoing / ↓ incoming commits. Click the counts to pull, like VS Code.
 - Staged and unstaged files as a tree, with compact folders.
-- Hover a file, a folder or a group to stage (+) or unstage (−) it.
+- Hover a file, a folder or a group to stage (+), unstage (−) or discard (↶) it. Discard asks first.
 - Click a file to see its diff in a resizable card below the list.
 - You choose the repositories for each project. The default is the repository of the focused terminal.
 
@@ -48,9 +48,9 @@ per project in Herdr's shared state.
 ## What it runs
 
 The mod runs `git` on your machine (status, diff, rev-parse, branch,
-rev-list, add, restore and rm --cached). It reads files only inside the selected repositories. It does
-not use the network and does not fetch, so the ↑/↓ counts are as of your last
-fetch.
+rev-list, add, restore, rm --cached and clean). It reads files only inside the selected repositories. It
+uses the network only when you click to pull (`git pull`). It does not fetch, so the ↑/↓ counts are
+as of your last fetch.
 
 ## Build it yourself
 

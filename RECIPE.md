@@ -4,8 +4,8 @@ A Changes panel for projects that hold several git repositories, like a VS Code
 multi-root workspace. You pick the repositories once per project. The panel then
 shows each repository as its own section with its branch, its incoming and
 outgoing commits, and its staged and unstaged files as a tree. Click a file to
-see its diff in a second card below the list. Hover a file or folder to stage or
-unstage it.
+see its diff in a second card below the list. Hover a file or folder to stage,
+unstage or discard it.
 
 ![Git Workbench](preview.png)
 
@@ -28,7 +28,10 @@ border, `theme().background` fill, 13px text in `theme().foreground`.
     first letter (`p/w` for `packages/web/<name>`, `..` kept),
     empty for the project root; it fills the free space. Then a 12px
     git-branch icon and the branch (11px, `dim`, at most 140px, truncated);
-    `↑N` (`ansi2`) and `↓N` (`ansi1`) at 11px, each only when above zero;
+    when ahead or behind, a sync button (radius 4px): a 12px Lucide
+    refresh-cw icon, then `↑N` (`ansi2`) and `↓N` (`ansi1`) at 11px, each only
+    when above zero. Its tooltip is "Pull N commits from origin/main" like
+    VS Code, or "N commits to push to origin/main"; a click pulls when behind;
     a count badge (10px, `muted`, `background` fill, radius 8px).
     When space is short the hint gives way first, then the name.
   - "No changes" (12px, `dim`, 8px indent) when the repo has none.
@@ -80,8 +83,13 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 - **Clicks:** a repo band, group row or folder row opens or closes it. A file
   row opens its diff; clicking it again or × closes it. When nothing is
   closed by hand, the top file row of the tree opens by itself.
-- **Hover** on a file, folder or group shows one 20px button: + on unstaged
-  (stages all files under it, conflicts left out), − on staged (unstages).
+- **Hover** on a file, folder or group shows 20px buttons: on unstaged, a
+  discard arrow (Lucide undo-2) and + (stages all files under it, conflicts
+  left out); on staged, − (unstages).
+- **Discard** asks first: a bar at the foot of the list card names the file,
+  folder or group and the file count, warns that untracked files are deleted
+  and that it cannot be undone, with Cancel and a red Discard. Conflicts and
+  nested repos are left out, and the button does not show when nothing is left.
 - **Hover** on the path hint shows the full path from the project root.
 - **Drag** the 8px gap between the cards to resize them (resize cursor). The
   height is saved in shared state for all panels and restarts. The list keeps
@@ -97,7 +105,7 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 
 - One mod, `mods/git-workbench/`: `main.js`, `mod.json`
   (`{"place": "right", "size": 368}`), `icons/` (Lucide: book-marked,
-  chevron-down, chevron-right, folder, git-branch, layers, minus, plus, x).
+  chevron-down, chevron-right, folder, git-branch, layers, minus, plus, refresh-cw, undo-2, x).
 - gpui-kit: `View`, `div`, `svg`; gpui-base: `v_flex`, `h_flex`,
   `Scrollbar`, `v_virtual_list`. Element events: `on_click`, `on_hover`,
   `on_mouse_down`, `on_mouse_up`, `on_mouse_move`, `on_size_change`, `tooltip`.
@@ -114,7 +122,8 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   `rev-list --left-right --count @{upstream}...HEAD`, `rev-parse --show-toplevel`.
   Actions use `git --literal-pathspecs`: `add -A -- <paths>`;
   `restore --staged -- <paths>`, or `rm --cached -f -q -r -- <paths>` when the
-  repo has no commit yet.
+  repo has no commit yet; discard: `restore --worktree -- <tracked paths>`
+  and `clean -f -q -- <untracked paths>`.
 - It works in a layout block (for example in place of the shipped `changes`
   in the right panel stack) or as a pane or tab.
 
@@ -137,6 +146,10 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 - In `init`, return early when `checking()` is true: `herdr-app check`
   must not run git.
 - The ↑/↓ counts are as of the last fetch. The mod does not fetch.
+- Pull runs `env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" git pull`
+  (2-minute timeout): there is no terminal for a password prompt, so a remote
+  that needs one fails with git's message in the note bar. Git's own pull
+  settings (merge, rebase, ff-only) apply.
 - "Add folder…" uses `pickFolder`, which works only on this computer. For a
   remote space, the button is hidden.
 - Paths are handled as `/`-separated, so it is built for Linux and macOS.
@@ -153,10 +166,14 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   section with a path hint, and it no longer shows as an untracked folder in
   its parent. The list stays after a restart.
 - + on an unstaged file moves it to Staged; − moves it back.
+- Discard on an unstaged file asks first; Cancel changes nothing, Discard
+  returns a tracked file to its staged or committed state and deletes an
+  untracked one. A file name with `[` or `*` affects only that file.
 - A file click opens the diff card with the right diff; × closes it, and the
   list card fills the panel.
 - Dragging the gap resizes the cards, and the height stays after a restart.
-- A repo whose branch is behind its upstream shows `↓N` in `ansi1`.
+- A repo whose branch is behind its upstream shows `↓N` in `ansi1`; a
+  click on it pulls, and the count goes away.
 - At zoom 1.1, the diff card's bottom border is visible.
 - During a merge conflict, the conflicted file's diff shows the conflict
   markers in green with line numbers from 1, and no marker columns in the text.

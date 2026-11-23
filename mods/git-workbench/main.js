@@ -179,7 +179,7 @@ export default class GitWorkbench extends View {
         if (asked !== locationKey()) return;
         if (!project) { this.stopWatching(); this.root = null; this.repos = []; this.error = "Not a git repository: " + (cwd || "no folder"); this.setOpen(null); return; }
         if (project.root !== this.root || on !== this.on) {
-          this.collapsed = new Set(); this.setOpen(null); this.closed = false; this.editing = false; this.note = null;
+          this.collapsed = new Set(); this.setOpen(null); this.closed = false; this.editing = false; this.note = null; this.pending = null;
         }
         this.root = project.root; this.on = on;
         const rels = ["", ...project.extra.filter(r => r !== "")];
@@ -211,10 +211,10 @@ export default class GitWorkbench extends View {
     // The name is the repo's folder; the hint is where it is, each parent folder by its first letter
     // (p/w for packages/web), ".." kept. The project root has no hint.
     const name = basename(path), hint = rel.split("/").slice(0, -1).map(p => p === ".." ? p : [...p][0]).join("/");
-    const repo = { path, rel, name, hint, branch: "", staged: [], changes: [], error: null, hasHead: true, limited: false, ahead: null, behind: null };
+    const repo = { path, rel, name, hint, branch: "", staged: [], changes: [], error: null, hasHead: true, limited: false, ahead: null, behind: null, upstream: null };
     try {
       const git = (args) => exec("git", [...READ, ...args], { cwd: path, on });
-      const [status, head, branch, cached, worktree, sync] = await Promise.all([
+      const [status, head, branch, cached, worktree, sync, upstream] = await Promise.all([
         git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]),
         git(["rev-parse", "--verify", "-q", "HEAD"]),
         git(["branch", "--show-current"]),
@@ -222,11 +222,13 @@ export default class GitWorkbench extends View {
         git(["diff", "--numstat", "-z", "--no-renames"]),
         // Commits behind and ahead of the upstream branch, as of the last fetch. Fails without an upstream.
         git(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]),
+        git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]),
       ]);
       if (status.code !== 0) throw new Error(status.stderr.trim() || "git status failed");
       repo.hasHead = head.code === 0;
       repo.branch = branch.stdout.trim() || "detached";
       if (sync.code === 0) { const [behind, ahead] = sync.stdout.trim().split(/\s+/).map(Number); repo.behind = behind; repo.ahead = ahead; }
+      if (upstream.code === 0) repo.upstream = upstream.stdout.trim();
       const stagedStats = {}, worktreeStats = {};
       if (cached.code === 0) parseNumstat(cached.stdout, stagedStats);
       if (worktree.code === 0) parseNumstat(worktree.stdout, worktreeStats);
@@ -312,8 +314,38 @@ export default class GitWorkbench extends View {
     cx.notify();
   }
 
+  // git pull with the repo's own settings (merge or rebase). No prompts: there is no terminal to answer them.
+  pull(repo, cx) {
+    if (this.busy) return;
+    this.busy = true; this.pulling = repo.path; this.note = null;
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec("env", ["GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes", "git", "pull"], { cwd: repo.path, on: this.on, timeout: 120000 });
+        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+      } catch (e) { this.note = repo.name + ": " + String(e?.message ?? e); }
+      finally { this.busy = false; this.pulling = null; this.refresh(cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
   stage(repo, files, cx) {
     if (files.length) this.act(repo, [["add", "-A", "--", ...files.map(f => f.path)]], cx);
+  }
+
+  // Discard asks first: it cannot be undone. Conflicts and nested repos are left out.
+  askDiscard(repo, files, label, cx) {
+    files = files.filter(f => !f.conflict && !f.nestedRepo);
+    if (files.length) this.pending = { repo, files, label };
+    cx.notify();
+  }
+
+  // Tracked files go back to their staged (or committed) state; untracked files are deleted.
+  discard(cx) {
+    const { repo, files } = this.pending ?? {};
+    this.pending = null;
+    if (!files?.length) return cx.notify();
+    const tracked = files.filter(f => !f.untracked).map(f => f.path), untracked = files.filter(f => f.untracked).map(f => f.path);
+    this.act(repo, [tracked.length ? ["restore", "--worktree", "--", ...tracked] : null, untracked.length ? ["clean", "-f", "-q", "--", ...untracked] : null], cx);
   }
 
   unstage(repo, files, cx) {
@@ -381,10 +413,13 @@ export default class GitWorkbench extends View {
     });
   }
 
-  actions(repo, group, files, id, t) {
+  actions(repo, group, files, id, label, t) {
     if (this.hovered !== id || this.busy) return [];
     if (group === "staged") return [this.iconButton(id + "-unstage", "minus", t, (cx) => this.unstage(repo, files, cx))];
-    return [this.iconButton(id + "-stage", "plus", t, (cx) => this.stage(repo, files.filter(f => !f.conflict), cx))];
+    return [
+      ...(files.some(f => !f.conflict && !f.nestedRepo) ? [this.iconButton(id + "-discard", "undo-2", t, (cx) => this.askDiscard(repo, files, label, cx))] : []),
+      this.iconButton(id + "-stage", "plus", t, (cx) => this.stage(repo, files.filter(f => !f.conflict), cx)),
+    ];
   }
 
   markColor(mark, t) {
@@ -411,7 +446,7 @@ export default class GitWorkbench extends View {
         .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
         .child(svg(ICON("folder")).size(13).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(name))
-        .children(this.actions(repo, group, files, id, t)), id) });
+        .children(this.actions(repo, group, files, id, path + "/", t)), id) });
       if (open) this.treeRows(repo, group, child, path, depth + 1, out, t);
     }
     for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
@@ -419,7 +454,7 @@ export default class GitWorkbench extends View {
       out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isOpen(sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
         .child(div().w(12).flex_none())
         .child(div().flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : "")))
-        .children(this.actions(repo, group, [f], id, t))
+        .children(this.actions(repo, group, [f], id, basename(f.path), t))
         .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + f.add)))
         .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("−" + f.del)))
         .child(div().w(12).flex_none().text_size(11).text_color(this.markColor(f.mark, t)).child(f.mark)), id) });
@@ -431,7 +466,7 @@ export default class GitWorkbench extends View {
     const key = "g:" + repo.path + ":" + group, open = !this.collapsed.has(key), id = "row-" + key;
     out.push({ h: ROW, el: this.hoverable(this.groupLine(id, 0, t).gap(6).on_click((_e, cx) => this.toggle(key, cx))
       .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(title))
-      .children(this.actions(repo, group, files, id, t))
+      .children(this.actions(repo, group, files, id, title.toLowerCase() + " files in " + repo.name, t))
       .child(div().px(5).rounded(8).bg(t.raised).text_size(10).text_color(t.muted).child(String(files.length))), id) });
     if (open) this.treeRows(repo, group, buildTree(files), "", 1, out, t);
   }
@@ -449,9 +484,7 @@ export default class GitWorkbench extends View {
         .when(Boolean(repo.hint), (e) => e.tooltip(repo.rel)))
       .child(svg(ICON("git-branch")).size(12).flex_none().text_color(t.dim))
       .child(div().flex_none().max_w(140).truncate().text_size(11).text_color(t.dim).child(repo.branch))
-      // The same style as the Spaces sidebar: only counts above zero, outgoing first.
-      .when(repo.ahead > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child("↑" + repo.ahead)))
-      .when(repo.behind > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child("↓" + repo.behind)))
+      .when(repo.ahead > 0 || repo.behind > 0, (e) => e.child(this.syncButton(repo, key, t)))
       .child(div().px(5).rounded(8).bg(t.background).text_size(10).text_color(t.muted).child(String(count))) });
     if (!open) return;
     if (repo.error) { out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().truncate().text_size(11).text_color(t.ansi1).child(repo.error) }); return; }
@@ -459,6 +492,22 @@ export default class GitWorkbench extends View {
     this.groupRows(repo, "staged", "Staged", repo.staged, out, t);
     this.groupRows(repo, "changes", "Unstaged", repo.changes, out, t);
     if (repo.limited) out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files") });
+  }
+
+  // Commits to pull and to push, in the same style as the Spaces sidebar: only counts above zero, outgoing first.
+  // Like VS Code, a click pulls when the branch is behind its upstream.
+  syncButton(repo, key, t) {
+    const pulling = this.pulling === repo.path, can = repo.behind > 0 && !this.busy;
+    const commits = (n) => n + (n === 1 ? " commit" : " commits"), upstream = repo.upstream || "upstream";
+    const tip = pulling ? "Pulling from " + upstream + "…"
+      : repo.behind > 0 ? "Pull " + commits(repo.behind) + " from " + upstream
+      : commits(repo.ahead) + " to push to " + upstream;
+    return h_flex().id("sync-" + key).flex_none().h(20).px(4).gap(4).items_center().rounded(4).tooltip(tip)
+      .when(can, (e) => e.cursor_pointer().hover((s) => s.bg(t.background)).on_click((_e, cx) => { cx.stop_propagation(); this.pull(repo, cx); }))
+      .when(!can, (e) => e.on_click((_e, cx) => cx.stop_propagation()))
+      .child(svg(ICON("refresh-cw")).size(12).flex_none().text_color(pulling ? t.foreground : t.dim))
+      .when(repo.ahead > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("↑" + repo.ahead)))
+      .when(repo.behind > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("↓" + repo.behind)));
   }
 
   editorRows(out, t) {
@@ -474,6 +523,20 @@ export default class GitWorkbench extends View {
     out.push({ h: 38, el: h_flex().h(38).flex_none().px(8).gap(6).items_center()
       .when(!this.on, (e) => e.child(button("add-folder", "Add folder…", (cx) => this.addFolder(cx))))
       .child(button("done", "Done", (cx) => this.editRepos(cx))) });
+  }
+
+  // Asks before a discard, at the foot of the list card.
+  discardBar(t) {
+    const { files, label } = this.pending, n = files.length, untracked = files.filter(f => f.untracked).length;
+    const button = (id, text, danger, onClick) => div().id(id).h(24).px(10).flex().flex_none().items_center().rounded(6).cursor_pointer().text_size(12)
+      .when(danger, (e) => e.bg(t.ansi1).text_color(t.background)).when(!danger, (e) => e.border_1().border_color(t.border))
+      .hover((s) => s.opacity(0.88)).on_click((_e, cx) => onClick(cx)).child(text);
+    return v_flex().px(10).py(8).gap(6).border_t(1).border_color(t.border).text_size(12)
+      .child(div().child("Discard changes in " + label + (n > 1 ? " (" + n + " files)" : "") + "?"))
+      .child(div().text_size(11).text_color(t.dim).child((untracked ? (untracked === n ? "The files are untracked and will be deleted. " : untracked + " untracked files will be deleted. ") : "") + "This cannot be undone."))
+      .child(h_flex().gap(6).justify_end()
+        .child(button("discard-cancel", "Cancel", false, (cx) => { this.pending = null; cx.notify(); }))
+        .child(button("discard-yes", "Discard", true, (cx) => this.discard(cx))));
   }
 
   // A bar over the diff: which file, which part (staged or not), and a button to close it.
@@ -511,7 +574,7 @@ export default class GitWorkbench extends View {
     const height = out.reduce((n, r) => n + r.h, 0) + 12;
     // Measured sizes and mouse positions are screen pixels; h() and the others are zoomed pixels.
     const zoom = Number(settings().zoom) || 1, panelHeight = (this.size?.height ?? 600) / zoom;
-    const available = panelHeight - 44 - (this.note ? 28 : 0) - (this.open ? CARD_GAP + 2 + DIFF_HEADER + DIFF_MIN : 0);
+    const available = panelHeight - 44 - (this.note ? 28 : 0) + (this.pending ? 80 : 0) - (this.open ? CARD_GAP + 2 + DIFF_HEADER + DIFF_MIN : 0);
     const listHeight = Math.max(56, Math.min(height, available));
     const empty = this.error || (this.loading ? "Loading changes…" : this.root ? null : "No folder");
     const card = () => v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border);
@@ -526,6 +589,7 @@ export default class GitWorkbench extends View {
           .when(this.editing, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.editRepos(cx))
           .child(svg(ICON("layers")).size(14).text_color(t.muted)))))
       .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("changes-list").absolute().inset_0()))
+      .when(Boolean(this.pending), (e) => e.child(this.discardBar(t)))
       .when(Boolean(this.note), (e) => e.child(div().px(10).py(6).border_t(1).border_color(t.border).text_size(11).text_color(t.ansi1).child(this.note)));
     const root = v_flex().id("git-workbench").on_size_change((size, cx) => { this.size = size; cx.notify(); }).size_full().min_h(0).text_color(t.foreground).text_size(13);
     if (!this.open || !this.size) return root.child(listCard);
@@ -539,7 +603,7 @@ export default class GitWorkbench extends View {
     // Drag the gap between the two cards to resize them. The first height is what the list needs;
     // after a drag, the height is kept in shared state for all panels and restarts.
     const total = panelHeight, most = Math.max(LIST_MIN, total - CARD_GAP - DIFF_HEADER - DIFF_MIN - 2);
-    const top = Math.min(most, Math.max(LIST_MIN, this.dragTop ?? (Number(shared(SPLIT)) || null) ?? 44 + (this.note ? 28 : 0) + listHeight));
+    const top = Math.min(most, Math.max(LIST_MIN, this.dragTop ?? (Number(shared(SPLIT)) || null) ?? 44 + (this.note ? 28 : 0) + (this.pending ? 80 : 0) + listHeight));
     const endDrag = () => {
       if (!this.drag) return;
       if (this.dragTop != null) setShared(SPLIT, Math.round(this.dragTop));
