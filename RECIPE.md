@@ -4,17 +4,18 @@ A Changes panel for projects that hold several git repositories, like a VS Code
 multi-root workspace. You pick the repositories once per project. The panel then
 shows each repository as its own section with its branch, its incoming and
 outgoing commits, and its staged and unstaged files as a tree. Click a file to
-see its diff in a second card below the list. Hover a file or folder to stage,
+see its diff in place of the list, like the Files view; ← goes back. Hover a file or folder to stage,
 unstage or discard it.
 
 ![Git Workbench](preview.png)
 
 ## What you see
 
-Two cards, top to bottom, 8px apart. Each card: radius 10px, 1px `theme().border`
-border, `theme().background` fill, 13px text in `theme().foreground`.
+One card, like the Files view: radius 10px, 1px `theme().border` border,
+`theme().background` fill, 13px text in `theme().foreground`. It shows the
+list, or the diff of one file in its place.
 
-**List card** (top):
+**List view**:
 
 - **Header**, 42px, 14px side padding, 1px bottom border: "Changes" (semibold);
   a badge "6 files · 2 repos" (10px, `muted`, 1px border, radius 4px, padding
@@ -47,19 +48,19 @@ border, `theme().background` fill, 13px text in `theme().foreground`.
     `M` in `blocked`. The open file's row has the `selected` fill.
 - An error note (11px, `ansi1`) under the list when an action fails.
 
-**Diff card** (bottom), only while a file is open:
+**Diff view**, while a file is open:
 
-- **Header**, 42px, same padding and border as the list header: file name
-  (semibold); repo path from the root plus the file's folders (11px, `dim`,
-  truncated); a "Staged" or "Unstaged" badge like the files badge; `+N`/`−N`;
-  a 20px × button.
+- **Header**, 42px, same padding and border as the list header, like the
+  Files view: a 20px "←" back button (`muted`); "Changes" (semibold); the
+  path from the project root (12px, `dim`, right-aligned, truncated, full path
+  as tooltip); a "Staged" or "Unstaged" badge like the files badge; `+N`/`−N`;
+  then 20px buttons for this file: − on staged; discard and + on unstaged.
 - **Diff**: 20px rows in a virtual list, `settings().font_family` or
   JetBrains Mono at 11px, horizontal and vertical scroll. Hunk lines (`@@`)
   have the `raised` fill and `dim` text. Other rows: a 30px right-aligned line
   number in `dim`, 10px gap, the text. Added lines have `ansi2` + `18` alpha
   fill, removed lines `ansi1` + `18`.
-
-With no file open, the list card fills the whole panel.
+- The discard bar and the error note show under the diff too.
 
 **Repository editor** (the layers button, shown in place of the list):
 "Repositories in <root>" (12px, `muted`); the root with "project root";
@@ -81,8 +82,11 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   Folder watches work on this computer only, so remote projects refresh on the
   timer. A failed watch is tried again after a minute.
 - **Clicks:** a repo band, group row or folder row opens or closes it. A file
-  row opens its diff; clicking it again or × closes it. When nothing is
-  closed by hand, the top file row of the tree opens by itself.
+  row opens its diff in place of the list. ← returns to the list at the same
+  scroll position (a `ScrollHandle`), with the file still selected.
+- **Actions in the diff view:** after a stage or unstage, the diff follows the
+  file to its other group. After a discard, or when the file has no changes
+  any more, the list shows again.
 - **Hover** on a file, folder or group shows 20px buttons: on unstaged, a
   discard arrow (Lucide undo-2) and + (stages all files under it, conflicts
   left out); on staged, − (unstages).
@@ -91,9 +95,6 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   and that it cannot be undone, with Cancel and a red Discard. Conflicts and
   nested repos are left out, and the button does not show when nothing is left.
 - **Hover** on the path hint shows the full path from the project root.
-- **Drag** the 8px gap between the cards to resize them (resize cursor). The
-  height is saved in shared state for all panels and restarts. The list keeps
-  at least 100px and the diff card at least 202px.
 - **Diffs:** staged files show `git diff --cached`, unstaged ones `git diff`,
   both with `--literal-pathspecs`. A conflicted file shows git's combined diff:
   `@@@` hunks with one marker column per parent. A line is red when any column
@@ -108,12 +109,12 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   chevron-down, chevron-right, folder, git-branch, layers, minus, plus, refresh-cw, undo-2, x).
 - gpui-kit: `View`, `div`, `svg`; gpui-base: `v_flex`, `h_flex`,
   `Scrollbar`, `v_virtual_list`. Element events: `on_click`, `on_hover`,
-  `on_mouse_down`, `on_mouse_up`, `on_mouse_move`, `on_size_change`, `tooltip`.
+  `tooltip`, `track_scroll` with gpui-base's `ScrollHandle`.
 - herdr: `spaces`, `panes`, `focused`, `exec`, `readTextFile`,
   `watchFolder`, `theme`, `settings`, `pickFolder`, `checking`,
   `shared`, `setShared`.
 - Shared state keys: `git-workbench.projects` (`{ "<machine:>/abs/root":
-  ["relative/repo", "../other"] }`) and `git-workbench.split` (px).
+  ["relative/repo", "../other"] }`).
 - Programs: `git` only. Reads use
   `git --no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false`:
   `status --porcelain=v1 -z --no-renames --untracked-files=all`,
@@ -131,14 +132,8 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 
 - Keep the repo list in `shared()`, not `localStorage`: Herdr runs several
   copies of a mod and each has its own `localStorage`, so copies disagree.
-- Observed in herdr-app 0.1.16 (the gpui-kit docs say otherwise): `on_size_change`
-  and mouse positions come in screen pixels, while `h()` and the other sizes are
-  zoomed pixels. At zoom 1.1 the cards overflowed until both were divided by
-  `settings().zoom`. Check this on your version before you copy it.
-- gpui-base's `v_resizable` draws a divider line that cannot be styled. The
-  drag handle here is a plain 8px div with mouse events. Mouse moves arrive
-  only while the pointer is over the panel, so a drag also ends when it leaves.
-- Before the first `on_size_change`, render the list card alone.
+- The list is not built while the diff shows, so its scroll position lives in
+  a `ScrollHandle` made in `init()` (released in `close()`).
 - A selected nested repo appears in its parent's status as an untracked
   folder. Drop entries inside other selected repos. Strip the trailing `/` of
   untracked folders and mark them as nested repos.
@@ -169,11 +164,11 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 - Discard on an unstaged file asks first; Cancel changes nothing, Discard
   returns a tracked file to its staged or committed state and deletes an
   untracked one. A file name with `[` or `*` affects only that file.
-- A file click opens the diff card with the right diff; × closes it, and the
-  list card fills the panel.
-- Dragging the gap resizes the cards, and the height stays after a restart.
+- A file click shows its diff in place of the list; ← shows the list again at
+  the same scroll position. + in the diff header keeps the diff open, now
+  under "Staged".
 - A repo whose branch is behind its upstream shows `↓N` in `ansi1`; a
   click on it pulls, and the count goes away.
-- At zoom 1.1, the diff card's bottom border is visible.
+- At zoom 1.1, the card's bottom border is visible in both views.
 - During a merge conflict, the conflicted file's diff shows the conflict
   markers in green with line numbers from 1, and no marker columns in the text.

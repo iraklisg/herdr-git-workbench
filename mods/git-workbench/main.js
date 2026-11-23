@@ -2,12 +2,11 @@
 // Derived from the "changes" mod shipped with Herdr (Apache-2.0); modified.
 // The repo list for a project is kept in Herdr's shared state ("git-workbench.projects"), keyed by the project root.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, Scrollbar, v_virtual_list, ScrollHandle } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, pickFolder, checking, shared, setShared } from "herdr";
 
 const ICON = (name) => "mods/git-workbench/icons/" + name + ".svg";
-const ROW = 26, REPO_ROW = 30, LIMIT = 1000, DIFF_MIN = 160, DIFF_HEADER = 42, GROUP_INDENT = 8, CARD_GAP = 8, LIST_MIN = 100;
-const SPLIT = "git-workbench.split";
+const ROW = 26, REPO_ROW = 30, LIMIT = 1000, GROUP_INDENT = 8;
 // The last terminal folder seen in each space. When a mod pane (this one, or any other)
 // has the focus, it has no folder, so the panel keeps showing the project of that terminal.
 // Kept at module level on purpose: every copy of the mod shares it.
@@ -101,12 +100,6 @@ function buildTree(files) {
   }
   return root;
 }
-// The top file row of a tree: folders come first, each level sorted by name.
-function firstFile(node) {
-  const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  if (dirs.length) return firstFile(dirs[0][1]);
-  return [...node.files].sort((a, b) => a.path.localeCompare(b.path))[0];
-}
 function filesUnder(node, out = []) {
   out.push(...node.files);
   for (const child of node.dirs.values()) filesUnder(child, out);
@@ -117,7 +110,8 @@ export default class GitWorkbench extends View {
   init(_props, cx) {
     this.repos = []; this.rows = []; this.diffWidth = 0;
     this.collapsed = new Set();
-    this.open = null; this.closed = false; this.editing = false;
+    this.open = null; this.selected = null; this.editing = false;
+    this.listScroll = ScrollHandle.new();
     if (checking()) return;
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -179,7 +173,7 @@ export default class GitWorkbench extends View {
         if (asked !== locationKey()) return;
         if (!project) { this.stopWatching(); this.root = null; this.repos = []; this.error = "Not a git repository: " + (cwd || "no folder"); this.setOpen(null); return; }
         if (project.root !== this.root || on !== this.on) {
-          this.collapsed = new Set(); this.setOpen(null); this.closed = false; this.editing = false; this.note = null; this.pending = null;
+          this.collapsed = new Set(); this.setOpen(null); this.selected = null; this.editing = false; this.note = null; this.pending = null;
         }
         this.root = project.root; this.on = on;
         const rels = ["", ...project.extra.filter(r => r !== "")];
@@ -188,11 +182,11 @@ export default class GitWorkbench extends View {
         if (asked !== locationKey()) return;
         this.repos = repos; this.error = null;
         this.watch(paths.filter(p => !paths.some(o => o !== p && inside(p, o))), cx);
-        const exists = (sel) => this.repos.find(r => r.path === sel.repo)?.[sel.group].some(f => f.path === sel.path);
-        if (this.open && !exists(this.open)) this.setOpen(null);
-        if (!this.open && !this.closed) {
-          const repo = this.repos.find(r => r.staged.length || r.changes.length);
-          if (repo) { const group = repo.staged.length ? "staged" : "changes"; this.open = { repo: repo.path, group, path: firstFile(buildTree(repo[group])).path }; }
+        // After a stage or unstage, the open file follows to its other group; when it is gone, the list shows again.
+        const find = (sel) => this.repos.find(r => r.path === sel.repo)?.[sel.group].some(f => f.path === sel.path);
+        if (this.open && !find(this.open)) {
+          const other = { ...this.open, group: this.open.group === "staged" ? "changes" : "staged" };
+          if (find(other)) { this.open = other; this.selected = other; } else this.setOpen(null);
         }
         if (this.open) {
           try { await this.load(this.open, asked); }
@@ -274,7 +268,8 @@ export default class GitWorkbench extends View {
     if (context === locationKey() && this.isOpen(sel)) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
 
-  isOpen(sel) { return Boolean(this.open && sel && this.open.repo === sel.repo && this.open.group === sel.group && this.open.path === sel.path); }
+  isSame(a, b) { return Boolean(a && b && a.repo === b.repo && a.group === b.group && a.path === b.path); }
+  isOpen(sel) { return this.isSame(this.open, sel); }
 
   setOpen(sel) { this.open = sel; this.setLines([]); }
 
@@ -284,16 +279,18 @@ export default class GitWorkbench extends View {
   }
 
   pick(sel, cx) {
-    const same = this.isOpen(sel);
-    this.setOpen(same ? null : sel); this.note = null; this.closed = same;
+    this.setOpen(sel); this.selected = sel; this.note = null; this.pending = null;
     const context = this.locKey;
-    if (!same) cx.spawn(async (cx) => {
+    cx.spawn(async (cx) => {
       try { await this.load(sel, context); }
       catch (e) { if (context === locationKey() && this.isOpen(sel)) this.note = "Cannot preview this diff (too large or unreadable): " + e; }
       cx.notify();
     });
     cx.notify();
   }
+
+  // Back to the list, at the same scroll position, with the file still selected.
+  back(cx) { this.setOpen(null); this.pending = null; cx.notify(); }
 
   toggle(key, cx) { if (this.collapsed.has(key)) this.collapsed.delete(key); else this.collapsed.add(key); cx.notify(); }
 
@@ -451,7 +448,7 @@ export default class GitWorkbench extends View {
     }
     for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
       const sel = { repo: repo.path, group, path: f.path }, id = "row-f:" + repo.path + ":" + group + ":" + f.path;
-      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isOpen(sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
+      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isSame(this.selected, sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
         .child(div().w(12).flex_none())
         .child(div().flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : "")))
         .children(this.actions(repo, group, [f], id, basename(f.path), t))
@@ -539,19 +536,25 @@ export default class GitWorkbench extends View {
         .child(button("discard-yes", "Discard", true, (cx) => this.discard(cx))));
   }
 
-  // A bar over the diff: which file, which part (staged or not), and a button to close it.
+  // The header of the diff view, like the Files view: back, the title, the file's path,
+  // then which part it is (staged or not), its line counts, and the actions for this file.
   diffHeader(t) {
     const repo = this.repos.find(r => r.path === this.open.repo), file = repo?.[this.open.group].find(f => f.path === this.open.path);
-    const parts = this.open.path.split("/"), name = parts.pop();
+    const path = [repo?.rel || repo?.name, this.open.path].filter(Boolean).join("/");
     // git reports no line counts for an untracked file: count the added lines of its preview.
     const add = file?.untracked ? this.rows.filter(r => r.kind === "+").length : file?.add ?? 0;
-    return h_flex().h(DIFF_HEADER).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-      .child(div().flex_none().font_semibold().child(name))
-      .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child([repo?.rel || repo?.name, ...parts].filter(Boolean).join("/")))
-      .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.open.group === "staged" ? "Staged" : "Unstaged"))
-      .when(add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + add)))
-      .when(file?.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("−" + file.del)))
-      .child(this.iconButton("diff-close", "x", t, (cx) => this.pick(this.open, cx)));
+    const staged = this.open.group === "staged";
+    return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+      .child(div().id("diff-back").w(20).flex_none().cursor_pointer().text_color(t.muted).on_click((_e, cx) => this.back(cx)).child("←"))
+      .child(div().flex_none().font_semibold().child("Changes"))
+      .child(div().id("diff-path").flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(path).child(path))
+      .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(staged ? "Staged" : "Unstaged"))
+      .when(add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child("+" + add)))
+      .when(file?.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child("−" + file.del)))
+      .when(Boolean(repo && file) && !this.busy, (e) => e
+        .when(staged, (e) => e.child(this.iconButton("diff-unstage", "minus", t, (cx) => this.unstage(repo, [file], cx))))
+        .when(!staged && !file.conflict && !file.nestedRepo, (e) => e.child(this.iconButton("diff-discard", "undo-2", t, (cx) => this.askDiscard(repo, [file], basename(file.path), cx))))
+        .when(!staged && !file.conflict, (e) => e.child(this.iconButton("diff-stage", "plus", t, (cx) => this.stage(repo, [file], cx)))));
   }
 
   diffRow({ kind, number, text }, t) {
@@ -564,23 +567,28 @@ export default class GitWorkbench extends View {
   render(cx) {
     if (!checking() && locationKey() !== this.locKey) this.refresh(cx);
     const t = theme();
+    const foot = (e) => e
+      .when(Boolean(this.pending), (e) => e.child(this.discardBar(t)))
+      .when(Boolean(this.note), (e) => e.child(div().px(10).py(6).border_t(1).border_color(t.border).text_size(11).text_color(t.ansi1).child(this.note)));
+    const card = v_flex().id("git-workbench").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13);
+    // A file click shows its diff in place of the list, like the Files view; back returns to the list.
+    if (this.open) return foot(card
+      .child(this.diffHeader(t))
+      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
+        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
+          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 20, (i) => String(i),
+            (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
+        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())));
     const files = this.repos.flatMap(r => [...r.staged, ...r.changes]);
     const add = files.reduce((n, f) => n + (f.add || 0), 0), del = files.reduce((n, f) => n + (f.del || 0), 0);
     const out = [];
     if (this.editing && this.root) this.editorRows(out, t);
     else for (const repo of this.repos) this.repoRows(repo, out, t);
-    // Two cards: the list, and the diff of the open file below it. Without an open file the list card fills the panel.
-    // listHeight is the first height of the list: what it needs, with at least DIFF_MIN left for the diff.
-    const height = out.reduce((n, r) => n + r.h, 0) + 12;
-    // Measured sizes and mouse positions are screen pixels; h() and the others are zoomed pixels.
-    const zoom = Number(settings().zoom) || 1, panelHeight = (this.size?.height ?? 600) / zoom;
-    const available = panelHeight - 44 - (this.note ? 28 : 0) + (this.pending ? 80 : 0) - (this.open ? CARD_GAP + 2 + DIFF_HEADER + DIFF_MIN : 0);
-    const listHeight = Math.max(56, Math.min(height, available));
     const empty = this.error || (this.loading ? "Loading changes…" : this.root ? null : "No folder");
-    const card = () => v_flex().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border);
-    const list = v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).children(out.map(r => r.el))
+    // The scroll handle keeps the list's position while a diff is shown.
+    const list = v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().track_scroll(this.listScroll).p(6).children(out.map(r => r.el))
       .when(!out.length || (!this.editing && Boolean(empty)), (e) => e.child(div().p(8).text_color(t.dim).child(empty || "No repositories")));
-    const listCard = card()
+    return foot(card
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Changes"))
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(files.length + " files · " + this.repos.length + (this.repos.length === 1 ? " repo" : " repos")))
@@ -588,34 +596,8 @@ export default class GitWorkbench extends View {
         .when(Boolean(this.root), (e) => e.child(div().id("edit-repos").size(24).flex().items_center().justify_center().rounded(6).cursor_pointer()
           .when(this.editing, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.editRepos(cx))
           .child(svg(ICON("layers")).size(14).text_color(t.muted)))))
-      .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("changes-list").absolute().inset_0()))
-      .when(Boolean(this.pending), (e) => e.child(this.discardBar(t)))
-      .when(Boolean(this.note), (e) => e.child(div().px(10).py(6).border_t(1).border_color(t.border).text_size(11).text_color(t.ansi1).child(this.note)));
-    const root = v_flex().id("git-workbench").on_size_change((size, cx) => { this.size = size; cx.notify(); }).size_full().min_h(0).text_color(t.foreground).text_size(13);
-    if (!this.open || !this.size) return root.child(listCard);
-    const diffCard = card()
-      .child(this.diffHeader(t))
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
-        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 20, (i) => String(i),
-            (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
-        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0()));
-    // Drag the gap between the two cards to resize them. The first height is what the list needs;
-    // after a drag, the height is kept in shared state for all panels and restarts.
-    const total = panelHeight, most = Math.max(LIST_MIN, total - CARD_GAP - DIFF_HEADER - DIFF_MIN - 2);
-    const top = Math.min(most, Math.max(LIST_MIN, this.dragTop ?? (Number(shared(SPLIT)) || null) ?? 44 + (this.note ? 28 : 0) + (this.pending ? 80 : 0) + listHeight));
-    const endDrag = () => {
-      if (!this.drag) return;
-      if (this.dragTop != null) setShared(SPLIT, Math.round(this.dragTop));
-      this.drag = null; this.dragTop = null;
-    };
-    return root
-      .on_mouse_move((e, cx) => { if (this.drag) { this.dragTop = Math.min(most, Math.max(LIST_MIN, this.drag.top + (e.position.y - this.drag.y) / zoom)); cx.notify(); } })
-      .on_mouse_up("left", (_e, cx) => { endDrag(); cx.notify(); })
-      .on_hover((hovered, cx) => { if (!hovered) { endDrag(); cx.notify(); } })
-      .child(div().flex_none().h(top).child(listCard))
-      .child(div().id("split-handle").flex_none().h(CARD_GAP).cursor_row_resize()
-        .on_mouse_down("left", (e, cx) => { this.drag = { y: e.position.y, top }; cx.stop_propagation(); }))
-      .child(div().flex_1().min_h(0).child(diffCard));
+      .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("changes-list").absolute().inset_0())));
   }
+
+  close() { this.listScroll?.release(); }
 }
