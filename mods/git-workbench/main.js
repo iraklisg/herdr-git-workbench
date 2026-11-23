@@ -79,13 +79,20 @@ function loadProjects() {
 function saveProjects(projects) { setShared(STORE, { ...projects }); }
 const projectKey = (root, on) => (on ? on + ":" : "") + root;
 
+// "add\tdel\tpath\0", or for a rename or copy "add\tdel\t\0old\0new\0". Keyed by the new path.
 function parseNumstat(text, into) {
-  for (const entry of text.split("\0")) {
-    const [a, d, ...parts] = entry.split("\t");
-    if (!parts.length) continue;
-    into[parts.join("\t")] = { add: Number(a) || 0, del: Number(d) || 0, binary: a === "-" };
+  const parts = text.split("\0");
+  for (let i = 0; i < parts.length; i++) {
+    const [a, d, ...rest] = parts[i].split("\t");
+    if (!rest.length) continue;
+    let path = rest.join("\t");
+    if (path === "") { path = parts[i + 2]; i += 2; }
+    if (path) into[path] = { add: Number(a) || 0, del: Number(d) || 0, binary: a === "-" };
   }
 }
+
+// A file's paths for an action: a rename moves both its old and its new path.
+const withOld = (files) => files.flatMap(f => f.old ? [f.old, f.path] : [f.path]);
 
 function buildTree(files) {
   const root = { dirs: new Map(), files: [] };
@@ -209,11 +216,11 @@ export default class GitWorkbench extends View {
     try {
       const git = (args) => exec("git", [...READ, ...args], { cwd: path, on });
       const [status, head, branch, cached, worktree, sync, upstream] = await Promise.all([
-        git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]),
+        git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
         git(["rev-parse", "--verify", "-q", "HEAD"]),
         git(["branch", "--show-current"]),
-        git(["diff", "--cached", "--numstat", "-z", "--no-renames"]),
-        git(["diff", "--numstat", "-z", "--no-renames"]),
+        git(["diff", "--cached", "--numstat", "-z"]),
+        git(["diff", "--numstat", "-z"]),
         // Commits behind and ahead of the upstream branch, as of the last fetch. Fails without an upstream.
         git(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]),
         git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]),
@@ -228,18 +235,24 @@ export default class GitWorkbench extends View {
       if (worktree.code === 0) parseNumstat(worktree.stdout, worktreeStats);
       // Other selected repos inside this one show as untracked folders here: they have their own section.
       const nested = all.filter(p => p !== path && inside(p, path)).map(p => relative(path, p));
-      const entries = status.stdout.split("\0").filter(Boolean);
+      // Renames and copies (git's own detection, as VS Code shows them) are "XY new\0old\0": the old path follows.
+      const parts = status.stdout.split("\0").filter(Boolean), entries = [];
+      for (let i = 0; i < parts.length; i++) {
+        const entry = parts[i], xy = entry.slice(0, 2), old = /[RC]/.test(xy) ? parts[++i] : undefined;
+        entries.push({ xy, file: entry.slice(3), old });
+      }
       repo.limited = entries.length > LIMIT;
-      for (const entry of entries.slice(0, LIMIT)) {
-        const xy = entry.slice(0, 2), file = entry.slice(3), clean = file.replace(/\/$/, "");
+      for (const { xy, file, old } of entries.slice(0, LIMIT)) {
+        const clean = file.replace(/\/$/, "");
         if (nested.some(n => clean === n || clean.startsWith(n + "/"))) continue;
         // An untracked folder here is a nested repo that is not in the list (git does not look inside it).
         if (xy === "??") { repo.changes.push({ path: clean, mark: "U", untracked: true, nestedRepo: file.endsWith("/"), add: 0, del: 0 }); continue; }
         if (xy === "!!") continue;
         if (xy.includes("U") || xy === "AA" || xy === "DD") { repo.changes.push({ path: file, mark: "!", conflict: true, add: 0, del: 0 }); continue; }
-        const [x, y] = xy;
-        if (x !== " ") repo.staged.push({ path: file, mark: x === "A" ? "A" : x === "D" ? "D" : "M", ...(stagedStats[file] ?? { add: 0, del: 0 }) });
-        if (y !== " ") repo.changes.push({ path: file, mark: y === "D" ? "D" : "M", ...(worktreeStats[file] ?? { add: 0, del: 0 }) });
+        const [x, y] = xy, mark = (c) => c === "A" || c === "D" || c === "R" || c === "C" ? c : "M";
+        // The old path goes with the side that renamed: the index (x), or an intent-to-add rename (y).
+        if (x !== " ") repo.staged.push({ path: file, mark: mark(x), ...(/[RC]/.test(x) ? { old } : {}), ...(stagedStats[file] ?? { add: 0, del: 0 }) });
+        if (y !== " ") repo.changes.push({ path: file, mark: mark(y), ...(/[RC]/.test(y) ? { old } : {}), ...(worktreeStats[file] ?? { add: 0, del: 0 }) });
       }
     } catch (e) { repo.error = String(e?.message ?? e); }
     return repo;
@@ -259,11 +272,12 @@ export default class GitWorkbench extends View {
         lines = ["@@ -0,0 +1," + count + " @@", ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => "+" + l)];
       }
     } else {
-      const args = ["--literal-pathspecs", ...READ, "diff", ...(sel.group === "staged" ? ["--cached"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", file.path];
+      // A rename shows as one diff of its changed lines: both paths, with rename detection on.
+      const args = ["--literal-pathspecs", ...READ, "diff", ...(sel.group === "staged" ? ["--cached"] : []), ...(file.old ? ["-M"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", ...(file.old ? [file.old] : []), file.path];
       const r = await exec("git", args, { cwd: repo.path, on: this.on });
       if (r.code !== 0) throw new Error(r.stderr);
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
-      lines = first < 0 ? [file.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
+      lines = first < 0 ? [file.binary ? "Binary file changed" : file.old ? (file.mark === "C" ? "Copied from " : "Renamed from ") + file.old + " · no content changes" : "No text diff available"] : all.slice(first);
     }
     if (context === locationKey() && this.isOpen(sel)) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
@@ -326,12 +340,12 @@ export default class GitWorkbench extends View {
   }
 
   stage(repo, files, cx) {
-    if (files.length) this.act(repo, [["add", "-A", "--", ...files.map(f => f.path)]], cx);
+    if (files.length) this.act(repo, [["add", "-A", "--", ...withOld(files)]], cx);
   }
 
   // Discard asks first: it cannot be undone. Conflicts and nested repos are left out.
   askDiscard(repo, files, label, cx) {
-    files = files.filter(f => !f.conflict && !f.nestedRepo);
+    files = files.filter(f => !f.conflict && !f.nestedRepo && !f.old);
     if (files.length) this.pending = { repo, files, label };
     cx.notify();
   }
@@ -347,7 +361,7 @@ export default class GitWorkbench extends View {
 
   unstage(repo, files, cx) {
     if (!files.length) return;
-    const paths = files.map(f => f.path);
+    const paths = withOld(files);
     this.act(repo, [repo.hasHead ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "-f", "-q", "-r", "--", ...paths]], cx);
   }
 
@@ -414,13 +428,13 @@ export default class GitWorkbench extends View {
     if (this.hovered !== id || this.busy) return [];
     if (group === "staged") return [this.iconButton(id + "-unstage", "minus", t, (cx) => this.unstage(repo, files, cx))];
     return [
-      ...(files.some(f => !f.conflict && !f.nestedRepo) ? [this.iconButton(id + "-discard", "undo-2", t, (cx) => this.askDiscard(repo, files, label, cx))] : []),
+      ...(files.some(f => !f.conflict && !f.nestedRepo && !f.old) ? [this.iconButton(id + "-discard", "undo-2", t, (cx) => this.askDiscard(repo, files, label, cx))] : []),
       this.iconButton(id + "-stage", "plus", t, (cx) => this.stage(repo, files.filter(f => !f.conflict), cx)),
     ];
   }
 
   markColor(mark, t) {
-    return mark === "A" || mark === "U" ? t.ansi2 : mark === "D" || mark === "!" ? t.ansi1 : t.blocked;
+    return mark === "A" || mark === "U" || mark === "R" || mark === "C" ? t.ansi2 : mark === "D" || mark === "!" ? t.ansi1 : t.blocked;
   }
 
   // A row inside a group, indented under its repo.
@@ -450,7 +464,8 @@ export default class GitWorkbench extends View {
       const sel = { repo: repo.path, group, path: f.path }, id = "row-f:" + repo.path + ":" + group + ":" + f.path;
       out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isSame(this.selected, sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
         .child(div().w(12).flex_none())
-        .child(div().flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : "")))
+        .child(div().id("name-" + id).flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : ""))
+          .when(Boolean(f.old), (e) => e.tooltip((f.mark === "C" ? "Copied from " : "Renamed from ") + f.old)))
         .children(this.actions(repo, group, [f], id, basename(f.path), t))
         .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + f.add)))
         .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("−" + f.del)))
@@ -547,13 +562,13 @@ export default class GitWorkbench extends View {
     return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
       .child(div().id("diff-back").w(20).flex_none().cursor_pointer().text_color(t.muted).on_click((_e, cx) => this.back(cx)).child("←"))
       .child(div().flex_none().font_semibold().child("Changes"))
-      .child(div().id("diff-path").flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(path).child(path))
+      .child(div().id("diff-path").flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(file?.old ? path + "\n" + (file.mark === "C" ? "Copied from " : "Renamed from ") + file.old : path).child(path))
       .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(staged ? "Staged" : "Unstaged"))
       .when(add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child("+" + add)))
       .when(file?.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child("−" + file.del)))
       .when(Boolean(repo && file) && !this.busy, (e) => e
         .when(staged, (e) => e.child(this.iconButton("diff-unstage", "minus", t, (cx) => this.unstage(repo, [file], cx))))
-        .when(!staged && !file.conflict && !file.nestedRepo, (e) => e.child(this.iconButton("diff-discard", "undo-2", t, (cx) => this.askDiscard(repo, [file], basename(file.path), cx))))
+        .when(!staged && !file.conflict && !file.nestedRepo && !file.old, (e) => e.child(this.iconButton("diff-discard", "undo-2", t, (cx) => this.askDiscard(repo, [file], basename(file.path), cx))))
         .when(!staged && !file.conflict, (e) => e.child(this.iconButton("diff-stage", "plus", t, (cx) => this.stage(repo, [file], cx)))));
   }
 

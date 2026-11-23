@@ -44,8 +44,10 @@ list, or the diff of one file in its place.
     only one folder shows as one row (`deep/a/b`). File rows have a 12px spacer,
     the file name (`dim` when deleted; a nested repo that is not in the list
     shows as `name/`), `+N`/`−N` (11px), and a 12px-wide status letter:
-    `A` and `U` (untracked) in `ansi2`, `D` and `!` (conflict) in `ansi1`,
-    `M` in `blocked`. The open file's row has the `selected` fill.
+    `A`, `R` (renamed), `C` (copied) and `U` (untracked) in `ansi2`, `D` and
+    `!` (conflict) in `ansi1`, `M` in `blocked`. A renamed file shows once,
+    by its new name, with "Renamed from <old path>" as the name's tooltip.
+    The selected file's row has the `selected` fill.
 - An error note (11px, `ansi1`) under the list when an action fails.
 
 **Diff view**, while a file is open:
@@ -117,9 +119,9 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   ["relative/repo", "../other"] }`).
 - Programs: `git` only. Reads use
   `git --no-optional-locks -c core.fsmonitor=false -c diff.autoRefreshIndex=false`:
-  `status --porcelain=v1 -z --no-renames --untracked-files=all`,
+  `status --porcelain=v1 -z --untracked-files=all`,
   `rev-parse --verify -q HEAD`, `branch --show-current`,
-  `diff [--cached] --numstat -z --no-renames`,
+  `diff [--cached] --numstat -z`,
   `rev-list --left-right --count @{upstream}...HEAD`, `rev-parse --show-toplevel`.
   Actions use `git --literal-pathspecs`: `add -A -- <paths>`;
   `restore --staged -- <paths>`, or `rm --cached -f -q -r -- <paths>` when the
@@ -137,6 +139,13 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 - A selected nested repo appears in its parent's status as an untracked
   folder. Drop entries inside other selected repos. Strip the trailing `/` of
   untracked folders and mark them as nested repos.
+- Renames follow git's own detection (`status.renames`, on by default), as in
+  VS Code. With `-z`, a status entry `R  new\0old\0` takes two fields, and a
+  numstat rename is `add\tdel\t\0old\0new\0`. The diff of a rename passes
+  `-M -- old new`; stage and unstage pass both paths. A staged rename that
+  was edited again is `RM`: `R` in Staged, `M` in Unstaged (VS Code shows
+  `R` in both, from its one-letter-per-file decorations). Discard leaves
+  renames out.
 - `watchFolder` allows 64 watches. Watch only the outermost selected repos.
 - In `init`, return early when `checking()` is true: `herdr-app check`
   must not run git.
@@ -161,6 +170,9 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   section with a path hint, and it no longer shows as an untracked folder in
   its parent. The list stays after a restart.
 - + on an unstaged file moves it to Staged; − moves it back.
+- After `git mv a b`, Staged shows one `R` row for `b`; its diff shows only
+  the changed lines (or "no content changes"); − unstages it as `D a` and
+  untracked `b`.
 - Discard on an unstaged file asks first; Cancel changes nothing, Discard
   returns a tracked file to its staged or committed state and deletes an
   untracked one. A file name with `[` or `*` affects only that file.
