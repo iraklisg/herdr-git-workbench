@@ -31,8 +31,10 @@ list, or the diff of one file in its place.
     git-branch icon and the branch (11px, `dim`, at most 140px, truncated);
     when ahead or behind, a sync button (radius 4px): a 12px Lucide
     refresh-cw icon, then `↑N` (`ansi2`) and `↓N` (`ansi1`) at 11px, each only
-    when above zero. Its tooltip is "Pull N commits from origin/main" like
-    VS Code, or "N commits to push to origin/main"; a click pulls when behind;
+    when above zero. Like VS Code, a click syncs: pull when behind, then
+    push when ahead; the icon spins (`spin(1000)`) while it works. Tooltip:
+    "Pull N commits from origin/main", "Push N commits to origin/main", or
+    "Pull N commits and push M commits with origin/main";
     a count badge (10px, `muted`, `background` fill, radius 8px).
     When space is short the hint gives way first, then the name.
   - "No changes" (12px, `dim`, 8px indent) when the repo has none.
@@ -150,10 +152,11 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
 - In `init`, return early when `checking()` is true: `herdr-app check`
   must not run git.
 - The ↑/↓ counts are as of the last fetch. The mod does not fetch.
-- Pull runs `env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" git pull`
-  (2-minute timeout): there is no terminal for a password prompt, so a remote
-  that needs one fails with git's message in the note bar. Git's own pull
-  settings (merge, rebase, ff-only) apply.
+- Sync runs `env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -o BatchMode=yes" git pull`,
+  then `git push` the same way (2-minute timeout each): there is no terminal
+  for a password prompt, so a remote that needs one fails with git's message
+  in the note bar. Git's own settings (merge, rebase, ff-only, push.default)
+  apply. A failed pull stops before the push.
 - "Add folder…" uses `pickFolder`, which works only on this computer. For a
   remote space, the button is hidden.
 - Paths are handled as `/`-separated, so it is built for Linux and macOS.
@@ -180,7 +183,8 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   the same scroll position. + in the diff header keeps the diff open, now
   under "Staged".
 - A repo whose branch is behind its upstream shows `↓N` in `ansi1`; a
-  click on it pulls, and the count goes away.
+  click on it pulls, and the count goes away. A repo that is ahead shows
+  `↑N` in `ansi2`; a click pushes. The icon spins while it works.
 - At zoom 1.1, the card's bottom border is visible in both views.
 - During a merge conflict, the conflicted file's diff shows the conflict
   markers in green with line numbers from 1, and no marker columns in the text.

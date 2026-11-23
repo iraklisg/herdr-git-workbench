@@ -5,7 +5,7 @@ A Changes panel for the [Herdr](https://herdr.dev) desktop app that shows
 
 ![Git Workbench](preview.png)
 
-- Each repository is its own section with its branch and its ↑ outgoing / ↓ incoming commits. Click the counts to pull, like VS Code.
+- Each repository is its own section with its branch and its ↑ outgoing / ↓ incoming commits. Click the counts to sync (pull and push), like VS Code.
 - Staged and unstaged files as a tree, with compact folders. Renames show as one row, like VS Code.
 - Hover a file, a folder or a group to stage (+), unstage (−) or discard (↶) it. Discard asks first.
 - Click a file to see its diff in the full panel, like the Files view; ← goes back. Stage, unstage or discard from there too.
@@ -49,7 +49,7 @@ per project in Herdr's shared state.
 
 The mod runs `git` on your machine (status, diff, rev-parse, branch,
 rev-list, add, restore, rm --cached and clean). It reads files only inside the selected repositories. It
-uses the network only when you click to pull (`git pull`). It does not fetch, so the ↑/↓ counts are
+uses the network only when you click to sync (`git pull`, `git push`). It does not fetch, so the ↑/↓ counts are
 as of your last fetch.
 
 ## Build it yourself

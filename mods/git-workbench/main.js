@@ -325,18 +325,22 @@ export default class GitWorkbench extends View {
     cx.notify();
   }
 
-  // git pull with the repo's own settings (merge or rebase). No prompts: there is no terminal to answer them.
-  pull(repo, cx) {
+  // Like VS Code's sync button: pull when behind, then push when ahead. Git's own settings apply
+  // (merge or rebase on pull). No prompts: there is no terminal to answer them.
+  sync(repo, cx) {
     if (this.busy) return;
-    this.busy = true; this.pulling = repo.path; this.note = null;
+    this.busy = true; this.syncing = repo.path; this.note = null;
+    const steps = [repo.behind > 0 ? "pull" : null, repo.ahead > 0 ? "push" : null].filter(Boolean);
+    cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("env", ["GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes", "git", "pull"], { cwd: repo.path, on: this.on, timeout: 120000 });
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        for (const step of steps) {
+          const r = await exec("env", ["GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes", "git", step], { cwd: repo.path, on: this.on, timeout: 120000 });
+          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        }
       } catch (e) { this.note = repo.name + ": " + String(e?.message ?? e); }
-      finally { this.busy = false; this.pulling = null; this.refresh(cx); cx.notify(); }
+      finally { this.busy = false; this.syncing = null; this.refresh(cx); cx.notify(); }
     });
-    cx.notify();
   }
 
   stage(repo, files, cx) {
@@ -507,17 +511,18 @@ export default class GitWorkbench extends View {
   }
 
   // Commits to pull and to push, in the same style as the Spaces sidebar: only counts above zero, outgoing first.
-  // Like VS Code, a click pulls when the branch is behind its upstream.
+  // Like VS Code, a click syncs (pull, push, or both), and the icon turns while it works.
   syncButton(repo, key, t) {
-    const pulling = this.pulling === repo.path, can = repo.behind > 0 && !this.busy;
+    const syncing = this.syncing === repo.path, can = !this.busy;
     const commits = (n) => n + (n === 1 ? " commit" : " commits"), upstream = repo.upstream || "upstream";
-    const tip = pulling ? "Pulling from " + upstream + "…"
+    const tip = syncing ? "Synchronizing with " + upstream + "…"
+      : repo.behind > 0 && repo.ahead > 0 ? "Pull " + commits(repo.behind) + " and push " + commits(repo.ahead) + " with " + upstream
       : repo.behind > 0 ? "Pull " + commits(repo.behind) + " from " + upstream
-      : commits(repo.ahead) + " to push to " + upstream;
+      : "Push " + commits(repo.ahead) + " to " + upstream;
     return h_flex().id("sync-" + key).flex_none().h(20).px(4).gap(4).items_center().rounded(4).tooltip(tip)
-      .when(can, (e) => e.cursor_pointer().hover((s) => s.bg(t.background)).on_click((_e, cx) => { cx.stop_propagation(); this.pull(repo, cx); }))
-      .when(!can, (e) => e.on_click((_e, cx) => cx.stop_propagation()))
-      .child(svg(ICON("refresh-cw")).size(12).flex_none().text_color(pulling ? t.foreground : t.dim))
+      .when(can, (e) => e.cursor_pointer().hover((s) => s.bg(t.background)))
+      .on_click((_e, cx) => { cx.stop_propagation(); if (can) this.sync(repo, cx); })
+      .child(svg(ICON("refresh-cw")).size(12).flex_none().text_color(t.dim).when(syncing, (e) => e.spin(1000)))
       .when(repo.ahead > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child("↑" + repo.ahead)))
       .when(repo.behind > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child("↓" + repo.behind)));
   }
