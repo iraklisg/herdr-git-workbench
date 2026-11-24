@@ -6,7 +6,7 @@ import { v_flex, h_flex, Scrollbar, v_virtual_list, ScrollHandle } from "gpui-ba
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, pickFolder, checking, shared, setShared } from "herdr";
 
 const ICON = (name) => "mods/git-workbench/icons/" + name + ".svg";
-const ROW = 26, REPO_ROW = 30, LIMIT = 1000, GROUP_INDENT = 8;
+const ROW = 26, REPO_ROW = 30, LIMIT = 1000, GROUP_INDENT = 8, RAIL_X = 10;
 // The last terminal folder seen in each space. When a mod pane (this one, or any other)
 // has the focus, it has no folder, so the panel keeps showing the project of that terminal.
 // Kept at module level on purpose: every copy of the mod shares it.
@@ -91,6 +91,38 @@ function parseNumstat(text, into) {
   }
 }
 
+// History. git log fields are split by \x1f, records by \x1e.
+const LOG_FORMAT = "--format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e", COMMITS = 50;
+function parseLog(text, side = "") {
+  return text.split("\x1e").map(s => s.replace(/^\n/, "")).filter(Boolean).map((rec) => {
+    const [sha, short, parents, author, at, refs, ...subject] = rec.split("\x1f");
+    // Remote HEAD pointers (origin/HEAD) say nothing new; the rest show as badges.
+    const names = refs ? refs.split(", ").filter(r => r && !/(^|\/)HEAD$/.test(r)) : [];
+    return { sha, short, parents: parents ? parents.split(" ") : [], author, at: Number(at), refs: names, subject: subject.join("\x1f"), side };
+  });
+}
+// "M\0path\0", or "R100\0old\0new\0" for a rename or copy.
+function parseNameStatus(text) {
+  const parts = text.split("\0"), out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const x = parts[i][0];
+    if (!x) continue;
+    if (x === "R" || x === "C") { out.push({ mark: x, old: parts[i + 1], path: parts[i + 2] }); i += 2; }
+    else { out.push({ mark: x === "A" || x === "D" ? x : "M", path: parts[i + 1] }); i += 1; }
+  }
+  return out;
+}
+function ago(at) {
+  const s = Math.max(0, Date.now() / 1000 - at);
+  for (const [n, unit] of [[31536000, "y"], [2592000, "mo"], [604800, "w"], [86400, "d"], [3600, "h"], [60, "m"]]) if (s >= n) return Math.floor(s / n) + unit;
+  return "now";
+}
+function when(at) {
+  const d = new Date(at * 1000), two = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + two(d.getMonth() + 1) + "-" + two(d.getDate()) + " " + two(d.getHours()) + ":" + two(d.getMinutes());
+}
+const isCommit = (sel) => Boolean(sel?.group.startsWith("commit:"));
+
 // A file's paths for an action: a rename moves both its old and its new path.
 const withOld = (files) => files.flatMap(f => f.old ? [f.old, f.path] : [f.path]);
 
@@ -118,7 +150,9 @@ export default class GitWorkbench extends View {
     this.repos = []; this.rows = []; this.diffWidth = 0;
     this.collapsed = new Set();
     this.open = null; this.selected = null; this.editing = false;
-    this.listScroll = ScrollHandle.new();
+    // History: which commits show their files, those files (by repo and sha), and how many commits per repo.
+    this.view = "changes"; this.expanded = new Set(); this.commitFiles = new Map(); this.limits = new Map();
+    this.listScroll = { changes: ScrollHandle.new(), history: ScrollHandle.new() };
     if (checking()) return;
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -181,21 +215,27 @@ export default class GitWorkbench extends View {
         if (!project) { this.stopWatching(); this.root = null; this.repos = []; this.error = "Not a git repository: " + (cwd || "no folder"); this.setOpen(null); return; }
         if (project.root !== this.root || on !== this.on) {
           this.collapsed = new Set(); this.setOpen(null); this.selected = null; this.editing = false; this.note = null; this.pending = null;
+          this.expanded = new Set(); this.commitFiles = new Map(); this.limits = new Map();
         }
         this.root = project.root; this.on = on;
         const rels = ["", ...project.extra.filter(r => r !== "")];
         const paths = rels.map(rel => rel ? normalize(this.root + "/" + rel) : this.root);
         const repos = await Promise.all(paths.map((path, i) => this.readRepo(path, rels[i], paths)));
         if (asked !== locationKey()) return;
+        if (this.view === "history") await Promise.all(repos.map(async (r) => {
+          if (!r.error && r.hasHead) r.history = await this.readHistory(r).catch((e) => ({ commits: [], incoming: [], error: String(e?.message ?? e) }));
+        }));
+        if (asked !== locationKey()) return;
         this.repos = repos; this.error = null;
         this.watch(paths.filter(p => !paths.some(o => o !== p && inside(p, o))), cx);
         // After a stage or unstage, the open file follows to its other group; when it is gone, the list shows again.
         const find = (sel) => this.repos.find(r => r.path === sel.repo)?.[sel.group].some(f => f.path === sel.path);
-        if (this.open && !find(this.open)) {
+        // A commit's files do not change: an open commit diff stays as it is.
+        if (this.open && !isCommit(this.open) && !find(this.open)) {
           const other = { ...this.open, group: this.open.group === "staged" ? "changes" : "staged" };
           if (find(other)) { this.open = other; this.selected = other; } else this.setOpen(null);
         }
-        if (this.open) {
+        if (this.open && !isCommit(this.open)) {
           try { await this.load(this.open, asked); }
           catch { if (asked === locationKey()) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
@@ -258,9 +298,54 @@ export default class GitWorkbench extends View {
     return repo;
   }
 
+  // The branch's last commits, which of them are not pushed, and the commits to pull (as of the last fetch).
+  async readHistory(repo) {
+    const git = (args) => exec("git", [...READ, ...args], { cwd: repo.path, on: this.on });
+    const limit = this.limits.get(repo.path) ?? COMMITS;
+    const [main, incoming, outgoing] = await Promise.all([
+      git(["log", LOG_FORMAT, "-n", String(limit + 1), "HEAD", "--"]),
+      repo.behind > 0 ? git(["log", LOG_FORMAT, "-n", String(COMMITS), "HEAD..@{upstream}", "--"]) : null,
+      repo.ahead > 0 ? git(["rev-list", "-n", "1000", "@{upstream}..HEAD", "--"]) : null,
+    ]);
+    if (main.code !== 0) throw new Error(main.stderr.trim() || "git log failed");
+    const unpushed = new Set(outgoing?.code === 0 ? outgoing.stdout.split("\n").filter(Boolean) : []);
+    const commits = parseLog(main.stdout).map(c => ({ ...c, side: unpushed.has(c.sha) ? "out" : "" }));
+    return { commits: commits.slice(0, limit), more: commits.length > limit, incoming: incoming?.code === 0 ? parseLog(incoming.stdout, "in") : [] };
+  }
+
+  // A commit's files open on a click: its changes against its first parent (the empty tree for a first commit).
+  toggleCommit(repo, commit, cx) {
+    const key = "c:" + repo.path + ":" + commit.sha, id = repo.path + "\0" + commit.sha;
+    if (this.expanded.has(key)) { this.expanded.delete(key); cx.notify(); return; }
+    this.expanded.add(key);
+    if (!this.commitFiles.has(id)) {
+      this.commitFiles.set(id, { loading: true, files: [] });
+      cx.spawn(async (cx) => {
+        try {
+          const git = (args) => exec("git", [...READ, ...args], { cwd: repo.path, on: this.on });
+          const base = commit.parents[0] ?? (await git(["hash-object", "-t", "tree", "/dev/null"])).stdout.trim();
+          const [names, stats] = await Promise.all([
+            git(["diff", "-M", "--name-status", "-z", base, commit.sha]),
+            git(["diff", "-M", "--numstat", "-z", base, commit.sha]),
+          ]);
+          if (names.code !== 0) throw new Error(names.stderr.trim());
+          const counts = {};
+          if (stats.code === 0) parseNumstat(stats.stdout, counts);
+          const all = parseNameStatus(names.stdout);
+          this.commitFiles.set(id, { base, limited: all.length > LIMIT, files: all.slice(0, LIMIT).map(f => ({ ...f, ...(counts[f.path] ?? { add: 0, del: 0 }) })) });
+        } catch (e) { this.commitFiles.set(id, { error: String(e?.message ?? e), files: [] }); }
+        cx.notify();
+      });
+    }
+    cx.notify();
+  }
+
+  commitEntry(sel) { return this.commitFiles.get(sel.repo + "\0" + sel.group.slice("commit:".length)); }
+  filesOf(sel) { return isCommit(sel) ? this.commitEntry(sel)?.files ?? [] : this.repos.find(r => r.path === sel.repo)?.[sel.group] ?? []; }
+
   async load(sel, context) {
-    const repo = this.repos.find(r => r.path === sel.repo), file = repo?.[sel.group].find(f => f.path === sel.path);
-    if (!file) return;
+    const repo = this.repos.find(r => r.path === sel.repo), file = this.filesOf(sel).find(f => f.path === sel.path);
+    if (!file || !repo) return;
     let lines;
     if (file.nestedRepo) lines = ["Nested git repository · add it with the repositories button to see its changes"];
     else if (file.untracked) {
@@ -273,7 +358,8 @@ export default class GitWorkbench extends View {
       }
     } else {
       // A rename shows as one diff of its changed lines: both paths, with rename detection on.
-      const args = ["--literal-pathspecs", ...READ, "diff", ...(sel.group === "staged" ? ["--cached"] : []), ...(file.old ? ["-M"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", ...(file.old ? [file.old] : []), file.path];
+      const range = isCommit(sel) ? [this.commitEntry(sel).base, sel.group.slice("commit:".length)] : sel.group === "staged" ? ["--cached"] : [];
+      const args = ["--literal-pathspecs", ...READ, "diff", ...range, ...(file.old ? ["-M"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", ...(file.old ? [file.old] : []), file.path];
       const r = await exec("git", args, { cwd: repo.path, on: this.on });
       if (r.code !== 0) throw new Error(r.stderr);
       const all = r.stdout.replace(/\n$/, "").split("\n"), first = all.findIndex((l) => l.startsWith("@@"));
@@ -305,6 +391,12 @@ export default class GitWorkbench extends View {
 
   // Back to the list, at the same scroll position, with the file still selected.
   back(cx) { this.setOpen(null); this.pending = null; cx.notify(); }
+
+  setView(view, cx) {
+    if (this.view === view) return;
+    this.view = view; this.hovered = null; this.pending = null;
+    this.refresh(cx); cx.notify();
+  }
 
   toggle(key, cx) { if (this.collapsed.has(key)) this.collapsed.delete(key); else this.collapsed.add(key); cx.notify(); }
 
@@ -429,7 +521,7 @@ export default class GitWorkbench extends View {
   }
 
   actions(repo, group, files, id, label, t) {
-    if (this.hovered !== id || this.busy) return [];
+    if (this.hovered !== id || this.busy || group.startsWith("commit:")) return [];
     if (group === "staged") return [this.iconButton(id + "-unstage", "minus", t, (cx) => this.unstage(repo, files, cx))];
     return [
       ...(files.some(f => !f.conflict && !f.nestedRepo && !f.old) ? [this.iconButton(id + "-discard", "undo-2", t, (cx) => this.askDiscard(repo, files, label, cx))] : []),
@@ -442,12 +534,21 @@ export default class GitWorkbench extends View {
   }
 
   // A row inside a group, indented under its repo.
-  groupLine(id, depth, t) {
+  // In History, rail is the color of the commit line that runs through the indent.
+  groupLine(id, depth, t, rail) {
     return h_flex().id(id).h(ROW).flex_none().pr(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
-      .child(div().w(GROUP_INDENT + depth * 14).flex_none());
+      .child(div().relative().h(ROW).w(GROUP_INDENT + depth * 14).flex_none()
+        .when(Boolean(rail), (e) => e.child(div().absolute().left(RAIL_X).w(2).top(0).bottom(0).bg(rail))));
   }
 
-  treeRows(repo, group, node, prefix, depth, out, t) {
+  // The commit graph's cell: a line (cut at the dot for the first and last commit) and a dot. A merge has a hollow dot.
+  railCell(color, first, last, merge, t) {
+    return div().relative().h(ROW).w(GROUP_INDENT + 14).flex_none()
+      .child(div().absolute().left(RAIL_X).w(2).top(first ? ROW / 2 : 0).bottom(last ? ROW / 2 : 0).bg(color))
+      .child(div().absolute().left(RAIL_X - 3).top(ROW / 2 - 4).size(8).rounded_full().border_2().border_color(color).bg(merge ? t.background : color));
+  }
+
+  treeRows(repo, group, node, prefix, depth, out, t, rail) {
     const dirs = [...node.dirs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
     for (let [name, child] of dirs) {
       // Compact folders: a folder holding only one folder shows as a/b/c.
@@ -457,16 +558,16 @@ export default class GitWorkbench extends View {
       }
       const path = prefix ? prefix + "/" + name : name, key = "d:" + repo.path + ":" + group + ":" + path, open = !this.collapsed.has(key);
       const id = "row-" + key, files = filesUnder(child);
-      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).on_click((_e, cx) => this.toggle(key, cx))
+      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t, rail).gap(6).on_click((_e, cx) => this.toggle(key, cx))
         .child(svg(ICON(open ? "chevron-down" : "chevron-right")).size(12).flex_none().text_color(t.dim))
         .child(svg(ICON("folder")).size(13).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().text_color(t.muted).child(name))
         .children(this.actions(repo, group, files, id, path + "/", t)), id) });
-      if (open) this.treeRows(repo, group, child, path, depth + 1, out, t);
+      if (open) this.treeRows(repo, group, child, path, depth + 1, out, t, rail);
     }
     for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
       const sel = { repo: repo.path, group, path: f.path }, id = "row-f:" + repo.path + ":" + group + ":" + f.path;
-      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t).gap(6).when(this.isSame(this.selected, sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
+      out.push({ h: ROW, el: this.hoverable(this.groupLine(id, depth, t, rail).gap(6).when(this.isSame(this.selected, sel), (e) => e.bg(t.selected)).on_click((_e, cx) => this.pick(sel, cx))
         .child(div().w(12).flex_none())
         .child(div().id("name-" + id).flex_1().min_w(0).truncate().when(f.mark === "D", (e) => e.text_color(t.dim)).child(basename(f.path) + (f.nestedRepo ? "/" : ""))
           .when(Boolean(f.old), (e) => e.tooltip((f.mark === "C" ? "Copied from " : "Renamed from ") + f.old)))
@@ -504,10 +605,55 @@ export default class GitWorkbench extends View {
       .child(div().px(5).rounded(8).bg(t.background).text_size(10).text_color(t.muted).child(String(count))) });
     if (!open) return;
     if (repo.error) { out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().truncate().text_size(11).text_color(t.ansi1).child(repo.error) }); return; }
+    if (this.view === "history") { this.historyRows(repo, out, t); return; }
     if (!count) out.push({ h: ROW, el: div().pl(GROUP_INDENT).h(ROW).flex_none().flex().items_center().text_size(12).text_color(t.dim).child("No changes") });
     this.groupRows(repo, "staged", "Staged", repo.staged, out, t);
     this.groupRows(repo, "changes", "Unstaged", repo.changes, out, t);
     if (repo.limited) out.push({ h: ROW, el: div().px(12).h(ROW).flex_none().text_size(11).text_color(t.dim).child("Showing the first 1,000 changed files") });
+  }
+
+  historyRows(repo, out, t) {
+    const h = repo.history;
+    const line = (text, color) => out.push({ h: ROW, el: div().pl(GROUP_INDENT).h(ROW).flex_none().flex().items_center().truncate().text_size(11).text_color(color ?? t.dim).child(text) });
+    if (!repo.hasHead) return line("No commits yet");
+    if (!h) return line("Loading commits…");
+    if (h.error) return line(h.error, t.ansi1);
+    // Like VS Code: the commits to pull first, then the branch, its unpushed commits in green.
+    if (h.incoming.length) {
+      line("Incoming from " + (repo.upstream || "upstream"));
+      h.incoming.forEach((c, i) => this.commitRows(repo, c, i === 0, i === h.incoming.length - 1, out, t));
+      line(repo.branch);
+    }
+    h.commits.forEach((c, i) => this.commitRows(repo, c, i === 0, i === h.commits.length - 1 && !h.more, out, t));
+    if (h.more) out.push({ h: ROW, el: h_flex().id("more-" + repo.path).h(ROW).flex_none().items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+      .child(div().relative().h(ROW).w(GROUP_INDENT + 14).flex_none().child(div().absolute().left(RAIL_X).w(2).top(0).h(ROW / 2).bg(t.accent)))
+      .child(div().text_size(12).text_color(t.dim).child("Load more commits"))
+      .on_click((_e, cx) => { this.limits.set(repo.path, (this.limits.get(repo.path) ?? COMMITS) + COMMITS); this.refresh(cx); }) });
+  }
+
+  commitRows(repo, c, first, last, out, t) {
+    const key = "c:" + repo.path + ":" + c.sha, open = this.expanded.has(key);
+    const color = c.side === "in" ? t.ansi1 : c.side === "out" ? t.ansi2 : t.accent;
+    // "HEAD -> main" is the branch you are on; "tag: v1" a tag.
+    const refs = c.refs.map(r => ({ head: r.startsWith("HEAD -> "), name: r.replace(/^HEAD -> /, "").replace(/^tag: /, "") }));
+    const badge = (r) => div().flex_none().max_w(110).truncate().px(5).rounded(8).text_size(10)
+      .when(r.head, (e) => e.bg(t.accent).text_color(t.accent_foreground)).when(!r.head, (e) => e.bg(t.raised).text_color(t.muted)).child(r.name);
+    out.push({ h: ROW, el: h_flex().id("row-" + key).h(ROW).flex_none().pr(6).gap(6).items_center().rounded(6).cursor_pointer().hover((s) => s.bg(t.hover))
+      .tooltip(c.short + " · " + c.author + " · " + when(c.at) + (c.parents.length > 1 ? " · merge" : "") + "\n" + c.subject + (c.refs.length ? "\n" + c.refs.join(", ") : ""))
+      .on_click((_e, cx) => this.toggleCommit(repo, c, cx))
+      .child(this.railCell(color, first, last && !open, c.parents.length > 1, t))
+      .child(div().flex_1().min_w(0).truncate().child(c.subject))
+      .children(refs.slice(0, 2).map(badge))
+      .when(refs.length > 2, (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child("+" + (refs.length - 2))))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(ago(c.at))) });
+    if (!open) return;
+    const entry = this.commitFiles.get(repo.path + "\0" + c.sha), rail = last ? null : color;
+    const line = (text, color2) => out.push({ h: ROW, el: this.groupLine("info-" + key, 1, t, rail).cursor_default().text_size(11).text_color(color2 ?? t.dim).child(text) });
+    if (!entry || entry.loading) return line("Loading files…");
+    if (entry.error) return line(entry.error, t.ansi1);
+    if (!entry.files.length) return line("No file changes");
+    this.treeRows(repo, "commit:" + c.sha, buildTree(entry.files), "", 1, out, t, rail);
+    if (entry.limited) line("Showing the first 1,000 files");
   }
 
   // Commits to pull and to push, in the same style as the Spaces sidebar: only counts above zero, outgoing first.
@@ -559,19 +705,20 @@ export default class GitWorkbench extends View {
   // The header of the diff view, like the Files view: back, the title, the file's path,
   // then which part it is (staged or not), its line counts, and the actions for this file.
   diffHeader(t) {
-    const repo = this.repos.find(r => r.path === this.open.repo), file = repo?.[this.open.group].find(f => f.path === this.open.path);
+    const repo = this.repos.find(r => r.path === this.open.repo), file = this.filesOf(this.open).find(f => f.path === this.open.path);
+    const commit = isCommit(this.open) ? this.open.group.slice("commit:".length) : null;
     const path = [repo?.rel || repo?.name, this.open.path].filter(Boolean).join("/");
     // git reports no line counts for an untracked file: count the added lines of its preview.
     const add = file?.untracked ? this.rows.filter(r => r.kind === "+").length : file?.add ?? 0;
     const staged = this.open.group === "staged";
     return h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
       .child(div().id("diff-back").w(20).flex_none().cursor_pointer().text_color(t.muted).on_click((_e, cx) => this.back(cx)).child("←"))
-      .child(div().flex_none().font_semibold().child("Changes"))
+      .child(div().flex_none().font_semibold().child(commit ? "History" : "Changes"))
       .child(div().id("diff-path").flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).tooltip(file?.old ? path + "\n" + (file.mark === "C" ? "Copied from " : "Renamed from ") + file.old : path).child(path))
-      .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(staged ? "Staged" : "Unstaged"))
+      .child(div().flex_none().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(commit ? commit.slice(0, 7) : staged ? "Staged" : "Unstaged"))
       .when(add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child("+" + add)))
       .when(file?.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child("−" + file.del)))
-      .when(Boolean(repo && file) && !this.busy, (e) => e
+      .when(Boolean(repo && file) && !commit && !this.busy, (e) => e
         .when(staged, (e) => e.child(this.iconButton("diff-unstage", "minus", t, (cx) => this.unstage(repo, [file], cx))))
         .when(!staged && !file.conflict && !file.nestedRepo && !file.old, (e) => e.child(this.iconButton("diff-discard", "undo-2", t, (cx) => this.askDiscard(repo, [file], basename(file.path), cx))))
         .when(!staged && !file.conflict, (e) => e.child(this.iconButton("diff-stage", "plus", t, (cx) => this.stage(repo, [file], cx)))));
@@ -606,18 +753,23 @@ export default class GitWorkbench extends View {
     else for (const repo of this.repos) this.repoRows(repo, out, t);
     const empty = this.error || (this.loading ? "Loading changes…" : this.root ? null : "No folder");
     // The scroll handle keeps the list's position while a diff is shown.
-    const list = v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().track_scroll(this.listScroll).p(6).children(out.map(r => r.el))
+    const tab = (id, label, view) => div().id(id).flex_none().font_semibold().cursor_pointer().when(this.view !== view, (e) => e.text_color(t.dim).hover((s) => s.text_color(t.foreground)))
+      .on_click((_e, cx) => this.setView(view, cx)).child(label);
+    const listId = this.view + "-list";
+    const list = v_flex().id(listId).absolute().inset_0().overflow_y_scroll().track_scroll(this.listScroll[this.view]).p(6).children(out.map(r => r.el))
       .when(!out.length || (!this.editing && Boolean(empty)), (e) => e.child(div().p(8).text_color(t.dim).child(empty || "No repositories")));
     return foot(card
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .child(div().font_semibold().child("Changes"))
-        .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(files.length + " files · " + this.repos.length + (this.repos.length === 1 ? " repo" : " repos")))
-        .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child("+" + add)).child(div().text_size(11).text_color(t.ansi1).child("−" + del))
+        // Two views of the same repos: their changes, and their commits.
+        .child(tab("view-changes", "Changes", "changes")).child(tab("view-history", "History", "history"))
+        .when(this.view === "changes", (e) => e.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(files.length + " files · " + this.repos.length + (this.repos.length === 1 ? " repo" : " repos"))))
+        .child(div().flex_1())
+        .when(this.view === "changes", (e) => e.child(div().text_size(11).text_color(t.ansi2).child("+" + add)).child(div().text_size(11).text_color(t.ansi1).child("−" + del)))
         .when(Boolean(this.root), (e) => e.child(div().id("edit-repos").size(24).flex().items_center().justify_center().rounded(6).cursor_pointer()
           .when(this.editing, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.editRepos(cx))
           .child(svg(ICON("layers")).size(14).text_color(t.muted)))))
-      .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical("changes-list").absolute().inset_0())));
+      .child(div().relative().flex_1().min_h(0).child(list).child(Scrollbar.vertical(listId).absolute().inset_0())));
   }
 
-  close() { this.listScroll?.release(); }
+  close() { for (const h of Object.values(this.listScroll ?? {})) h.release(); }
 }

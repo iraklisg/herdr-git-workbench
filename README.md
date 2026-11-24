@@ -9,6 +9,7 @@ A Changes panel for the [Herdr](https://herdr.dev) desktop app that shows
 - Staged and unstaged files as a tree, with compact folders. Renames show as one row, like VS Code.
 - Hover a file, a folder or a group to stage (+), unstage (−) or discard (↶) it. Discard asks first.
 - Click a file to see its diff in the full panel, like the Files view; ← goes back. Stage, unstage or discard from there too.
+- A History tab shows each repository's commits on a line, like VS Code's graph, with incoming and unpushed commits. Click a commit to see its files, and a file to see its diff.
 - You choose the repositories for each project. The default is the repository of the focused terminal.
 
 ## Install

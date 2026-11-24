@@ -17,7 +17,9 @@ list, or the diff of one file in its place.
 
 **List view**:
 
-- **Header**, 42px, 14px side padding, 1px bottom border: "Changes" (semibold);
+- **Header**, 42px, 14px side padding, 1px bottom border: two view tabs,
+  "Changes" and "History", 8px apart (both semibold; the other one `dim`, `foreground`
+  on hover). In Changes:
   a badge "6 files · 2 repos" (10px, `muted`, 1px border, radius 4px, padding
   5px × 1px); free space; total `+N` in `ansi2` and `−N` in `ansi1` (11px);
   a 24px "layers" icon button (radius 6px) that opens the repository editor.
@@ -52,13 +54,34 @@ list, or the diff of one file in its place.
     The selected file's row has the `selected` fill.
 - An error note (11px, `ansi1`) under the list when an action fails.
 
+**History view** (the History tab): the same repo bands; under each, the
+branch's last 50 commits, newest first, with "Load more commits" (+50).
+
+- When the branch is behind, first "Incoming from origin/main" (11px, `dim`),
+  the commits to pull, then the branch name, then the branch's commits.
+- **Commit rows**, 26px: a 22px rail cell (a 2px line at x=10, cut at the dot
+  for the first and last commit; an 8px dot, hollow with a `background` fill
+  for a merge), the subject (truncated), up to two ref badges (10px, radius
+  8px, max 110px: the checked-out branch in `accent`/`accent_foreground`,
+  others `raised`/`muted`, "tag: " and "HEAD -> " dropped, `*/HEAD` left
+  out, "+N" for more), and the age ("now", "5m", "3h", "2d", "1w", "4mo", "1y";
+  11px, `dim`). The line and dot are `accent`; unpushed commits `ansi2`;
+  incoming commits `ansi1`. Tooltip: short hash · author · local date and
+  time (· merge), the subject, and all refs.
+- **A click on a commit** shows its changed files under it, as the same tree
+  as Changes (marks, counts, renames), with the commit's line running through
+  the indent. The files are its changes against its first parent (the empty
+  tree for a first commit), loaded once and kept. No actions on past commits.
+
 **Diff view**, while a file is open:
 
 - **Header**, 42px, same padding and border as the list header, like the
-  Files view: a 20px "←" back button (`muted`); "Changes" (semibold); the
+  Files view: a 20px "←" back button (`muted`); "Changes" or "History"
+  (semibold); the
   path from the project root (12px, `dim`, right-aligned, truncated, full path
-  as tooltip); a "Staged" or "Unstaged" badge like the files badge; `+N`/`−N`;
-  then 20px buttons for this file: − on staged; discard and + on unstaged.
+  as tooltip); a "Staged" or "Unstaged" badge like the files badge (for a
+  commit's file, its 7-character hash); `+N`/`−N`; then 20px buttons for
+  this file: − on staged; discard and + on unstaged; none for a commit.
 - **Diff**: 20px rows in a virtual list, `settings().font_family` or
   JetBrains Mono at 11px, horizontal and vertical scroll. Hunk lines (`@@`)
   have the `raised` fill and `dim` text. Other rows: a 30px right-aligned line
@@ -125,6 +148,11 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   `rev-parse --verify -q HEAD`, `branch --show-current`,
   `diff [--cached] --numstat -z`,
   `rev-list --left-right --count @{upstream}...HEAD`, `rev-parse --show-toplevel`.
+  History (only while it shows): `log --format=%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e -n 51 HEAD --`,
+  the same for `HEAD..@{upstream}` (incoming), `rev-list @{upstream}..HEAD`
+  (unpushed); a commit's files: `diff -M --name-status -z <parent> <sha>` and
+  `diff -M --numstat -z <parent> <sha>`, with `hash-object -t tree /dev/null`
+  as the parent of a first commit; its file diff: `diff <parent> <sha> -- <path>`.
   Actions use `git --literal-pathspecs`: `add -A -- <paths>`;
   `restore --staged -- <paths>`, or `rm --cached -f -q -r -- <paths>` when the
   repo has no commit yet; discard: `restore --worktree -- <tracked paths>`
@@ -186,5 +214,10 @@ this computer) and a "Done" button (26px high, 1px border, radius 6px).
   click on it pulls, and the count goes away. A repo that is ahead shows
   `↑N` in `ansi2`; a click pushes. The icon spins while it works.
 - At zoom 1.1, the card's bottom border is visible in both views.
+- History shows the branch's commits with refs and ages; a repo that is
+  ahead and behind shows the incoming commits first and its unpushed commits
+  in green. A click on a merge commit lists the files it brought in (against
+  its first parent); a click on one of them opens its diff with the commit's
+  hash in the header, and ← returns to History.
 - During a merge conflict, the conflicted file's diff shows the conflict
   markers in green with line numbers from 1, and no marker columns in the text.
